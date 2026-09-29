@@ -181,6 +181,20 @@ independently demoable.
 - systemd user service + autostart on login; **`.deb` + PPA** packaging.
 - **Demo:** `apt install`, log in, it just works. **Exit criteria:** all §7 success criteria met.
 
+**Platform reality & risks (discovered 2026-09-29)**
+- **Dev machine is Ubuntu 22.04 (jammy), GNOME 42, running an X11 session.** Its GTK4 (4.6)
+  and libadwaita (1.1) are too old for modern Rust bindings; libadwaita work needs a newer
+  runtime (24.04+ target, or a distrobox/Flatpak SDK for local GUI dev). This affects M2, not M1.
+- **Backend order flipped to X11-first.** Because the dev session is X11, the X11/XFixes
+  capture path is built and validated first (pure-Rust `x11rb`, no system `-dev` libs). The
+  Wayland backend follows.
+- **GNOME + Wayland clipboard-watch is a real risk for the P0 daemon.** GNOME/Mutter did not
+  implement `wlr-data-control`; background clipboard watching relies on the newer
+  `ext-data-control-v1`, which only landed in Mutter 47+ (GNOME 47+). Ubuntu 24.04 LTS ships
+  GNOME 46, so the target may lack it — the Wayland backend must detect `ext-data-control`
+  availability and, where absent, fall back (revisit: a minimal GNOME Shell helper, or document
+  Wayland support as GNOME 47+/KDE/wlroots for now). To be resolved before/at the Wayland backend.
+
 **Sequencing notes**
 - M1→M2 is the critical path; everything else layers on the store + IPC they establish.
 - P1 items are folded into the milestone where they're cheapest (11→M1, 12/13→M3, 15/16→M5),

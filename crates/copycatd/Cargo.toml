@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 copycat-core = { workspace = true }
+x11rb = { version = "0.13", features = ["xfixes"] }

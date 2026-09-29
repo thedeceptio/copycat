@@ -1,8 +1,13 @@
 //! copycatd — the clipboard capture daemon.
 //!
-//! M0 scaffold: opens (creating if needed) the history store and exits. The
-//! Wayland `wlr-data-control` capture loop and X11/XFixes fallback land in M1.
+//! Opens the history store, detects the display session, and runs the matching
+//! capture backend. M1 implements the X11/XFIXES backend; the Wayland backend
+//! (ext/wlr-data-control) follows.
 
+mod backend;
+mod capture;
+
+use backend::SessionType;
 use copycat_core::Store;
 use std::path::PathBuf;
 
@@ -18,15 +23,37 @@ fn main() {
         }
     };
 
-    match Store::open(&db_path) {
-        Ok(_store) => eprintln!("copycatd: history store ready at {}", db_path.display()),
+    let store = match Store::open(&db_path) {
+        Ok(s) => {
+            eprintln!("copycatd: history store ready at {}", db_path.display());
+            s
+        }
         Err(e) => {
             eprintln!("copycatd: failed to open history store: {e}");
             std::process::exit(1);
         }
-    }
+    };
 
-    eprintln!("copycatd: M0 scaffold — capture loop lands in M1. Exiting cleanly.");
+    match SessionType::detect() {
+        SessionType::X11 => {
+            eprintln!("copycatd: X11 session detected");
+            if let Err(e) = backend::x11::run(&store) {
+                eprintln!("copycatd: X11 backend error: {e}");
+                std::process::exit(1);
+            }
+        }
+        SessionType::Wayland => {
+            eprintln!(
+                "copycatd: Wayland session detected — the Wayland backend is not implemented \
+                 yet (X11 first). Exiting."
+            );
+        }
+        SessionType::Unknown => {
+            eprintln!(
+                "copycatd: no display session detected (no DISPLAY/WAYLAND_DISPLAY). Exiting."
+            );
+        }
+    }
 }
 
 /// Resolve the history database path under the XDG data home, creating the
