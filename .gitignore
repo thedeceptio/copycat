@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# Backups / editor cruft
+**/*.rs.bk
+*.swp
+.DS_Store
+
+# Local env
+.env

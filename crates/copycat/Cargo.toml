@@ -1,0 +1,17 @@
+[package]
+name = "copycat"
+description = "copycat clipboard manager (GTK4/libadwaita app)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "copycat"
+path = "src/main.rs"
+
+[dependencies]
+copycat-core = { workspace = true }
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7" }

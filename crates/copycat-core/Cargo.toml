@@ -1,0 +1,13 @@
+[package]
+name = "copycat-core"
+description = "Shared models and storage for copycat (clipboard manager)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+thiserror = { workspace = true }

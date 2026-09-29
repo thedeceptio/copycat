@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/copycat-core",
+    "crates/copycatd",
+    "crates/copycat",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/thedeceptio/copycat"
+authors = ["thedeceptio <thedeceptio@gmail.com>"]
+
+[workspace.dependencies]
+copycat-core = { path = "crates/copycat-core" }
+thiserror = "2"
