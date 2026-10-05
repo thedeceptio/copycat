@@ -100,6 +100,13 @@ small contributor pool and more manual Wayland interop. Rust's one real cost —
 is a one-time expense against a long-lived daemon.
 
 - **UI toolkit:** `gtk4-rs` + `libadwaita` bindings.
+  - **M2 dev toolchain — LOCKED: native host, bindings pinned to the host GTK.** The dev
+    machine is jammy (GTK 4.6 / libadwaita 1.1), so the Rust bindings are pinned down to match
+    (older `gtk4`/`libadwaita` crate versions) and the GUI is built/run natively — no container.
+    The ship target stays 24.04+ (GTK 4.14 / libadwaita 1.5); older bindings are forward-
+    compatible, so the same code builds on the newer target and in CI. Trade-off accepted:
+    dated bindings now in exchange for the simplest native loop; modern-binding uplift is
+    deferred. (Docker-24.04 was the considered alternative; rejected for setup overhead.)
 - **Wayland clipboard:** `wayland-client` + protocol bindings generated from `wlr-data-control` XML.
 - **X11 fallback:** XFixes clipboard notifications.
 - **Storage:** SQLite (`rusqlite`) for metadata + text; image blobs on disk referenced by hash (`sha2`).

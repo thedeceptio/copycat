@@ -13,5 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 copycat-core = { workspace = true }
-gtk = { package = "gtk4", version = "0.9" }
-adw = { package = "libadwaita", version = "0.7" }
+# Bindings pinned to the host GTK (4.6) / libadwaita (1.1); see SPEC §5.1.
+# libadwaita is added back once the plain-GTK toolchain is validated.
+gtk = { package = "gtk4", version = "0.5" }
