@@ -5,10 +5,12 @@
 //! [`Store`]. Both the daemon (`copycatd`) and the app (`copycat`) depend on it.
 
 pub mod model;
+pub mod paths;
 pub mod search;
 pub mod store;
 
 pub use model::{content_hash, Clip, ClipKind, NewClip};
+pub use paths::default_db_path;
 pub use search::rank;
 pub use store::{Store, StoreError};
 

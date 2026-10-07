@@ -8,14 +8,13 @@ mod backend;
 mod capture;
 
 use backend::SessionType;
-use copycat_core::Store;
-use std::path::PathBuf;
+use copycat_core::{default_db_path, Store};
 
 fn main() {
     let version = env!("CARGO_PKG_VERSION");
     eprintln!("copycatd {version} starting");
 
-    let db_path = match history_db_path() {
+    let db_path = match default_db_path() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("copycatd: cannot determine data directory: {e}");
@@ -54,23 +53,4 @@ fn main() {
             );
         }
     }
-}
-
-/// Resolve the history database path under the XDG data home, creating the
-/// containing directory if needed. Falls back to `$HOME/.local/share`.
-fn history_db_path() -> std::io::Result<PathBuf> {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "neither XDG_DATA_HOME nor HOME is set",
-            )
-        })?;
-
-    let dir = data_home.join("copycat");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("history.db"))
 }

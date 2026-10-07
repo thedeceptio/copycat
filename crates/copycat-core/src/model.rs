@@ -105,6 +105,12 @@ pub fn preview_of(text: &str) -> String {
     }
 }
 
+/// Collapse text to a single display line: runs of whitespace (including
+/// newlines and tabs) become single spaces, with the ends trimmed.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Content hash used for duplicate detection.
 ///
 /// The kind is mixed in so that, e.g., identical bytes captured as text vs. an
@@ -146,6 +152,12 @@ mod tests {
     #[test]
     fn preview_trims_whitespace() {
         assert_eq!(preview_of("   hello \n"), "hello");
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace() {
+        assert_eq!(one_line("a\nb\tc   d"), "a b c d");
+        assert_eq!(one_line("  padded \n line  "), "padded line");
     }
 
     #[test]
