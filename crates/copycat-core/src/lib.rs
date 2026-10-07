@@ -5,9 +5,11 @@
 //! [`Store`]. Both the daemon (`copycatd`) and the app (`copycat`) depend on it.
 
 pub mod model;
+pub mod search;
 pub mod store;
 
 pub use model::{content_hash, Clip, ClipKind, NewClip};
+pub use search::rank;
 pub use store::{Store, StoreError};
 
 use std::time::{SystemTime, UNIX_EPOCH};

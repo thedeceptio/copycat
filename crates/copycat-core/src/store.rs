@@ -42,6 +42,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS clips (
                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
                  kind       TEXT    NOT NULL,
+                 content    TEXT    NOT NULL DEFAULT '',
                  preview    TEXT    NOT NULL,
                  hash       TEXT    NOT NULL UNIQUE,
                  created_at INTEGER NOT NULL,
@@ -49,6 +50,7 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS idx_clips_created ON clips(created_at);",
         )?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -82,9 +84,15 @@ impl Store {
         }
 
         self.conn.execute(
-            "INSERT INTO clips (kind, preview, hash, created_at, pinned)
-             VALUES (?1, ?2, ?3, ?4, 0)",
-            params![new.kind.as_str(), new.preview, new.hash, created_at],
+            "INSERT INTO clips (kind, content, preview, hash, created_at, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![
+                new.kind.as_str(),
+                new.content,
+                new.preview,
+                new.hash,
+                created_at
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -92,7 +100,7 @@ impl Store {
     /// The most recent clips, pinned first then newest-first, capped at `limit`.
     pub fn recent(&self, limit: usize) -> Result<Vec<Clip>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, preview, hash, created_at, pinned FROM clips
+            "SELECT id, kind, content, preview, hash, created_at, pinned FROM clips
              ORDER BY pinned DESC, created_at DESC
              LIMIT ?1",
         )?;
@@ -100,15 +108,15 @@ impl Store {
         collect(rows)
     }
 
-    /// Clips whose preview contains `query` (case-insensitive), pinned first
-    /// then newest-first, capped at `limit`.
+    /// Clips whose full content contains `query` (case-insensitive), pinned
+    /// first then newest-first, capped at `limit`.
     ///
-    /// This is the candidate filter; fuzzy ranking lives in the app layer.
+    /// This is the candidate filter; fuzzy ranking lives in [`crate::search`].
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
         let like = format!("%{}%", escape_like(query));
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, preview, hash, created_at, pinned FROM clips
-             WHERE preview LIKE ?1 ESCAPE '\\'
+            "SELECT id, kind, content, preview, hash, created_at, pinned FROM clips
+             WHERE content LIKE ?1 ESCAPE '\\'
              ORDER BY pinned DESC, created_at DESC
              LIMIT ?2",
         )?;
@@ -186,11 +194,40 @@ fn row_to_clip(row: &Row<'_>) -> rusqlite::Result<Clip> {
     Ok(Clip {
         id: row.get(0)?,
         kind,
-        preview: row.get(2)?,
-        hash: row.get(3)?,
-        created_at: row.get(4)?,
-        pinned: row.get::<_, i64>(5)? != 0,
+        content: row.get(2)?,
+        preview: row.get(3)?,
+        hash: row.get(4)?,
+        created_at: row.get(5)?,
+        pinned: row.get::<_, i64>(6)? != 0,
     })
+}
+
+/// Apply schema migrations to an existing database.
+///
+/// New databases are created with the current schema above; this brings
+/// pre-existing ones (e.g. M1 databases without a `content` column) up to date.
+fn migrate(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "clips", "content")? {
+        conn.execute(
+            "ALTER TABLE clips ADD COLUMN content TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `table` has a column named `column`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    // `table` is an internal literal, never user input.
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn collect(
@@ -258,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn search_filters_by_preview_and_is_literal_for_wildcards() {
+    fn search_filters_by_content_and_is_literal_for_wildcards() {
         let s = store();
         s.insert_at(&NewClip::text("hello world"), 100).unwrap();
         s.insert_at(&NewClip::text("goodbye"), 200).unwrap();
@@ -271,6 +308,52 @@ mod tests {
         let pct = s.search("100%", 10).unwrap();
         assert_eq!(pct.len(), 1);
         assert_eq!(pct[0].preview, "100% sure");
+    }
+
+    #[test]
+    fn stores_and_returns_full_content_beyond_preview_length() {
+        let s = store();
+        // Longer than the preview cap, with a needle only in the tail.
+        let long = format!("{}NEEDLE_TAIL", "x".repeat(500));
+        s.insert_at(&NewClip::text(&long), 100).unwrap();
+
+        let recent = s.recent(10).unwrap();
+        assert_eq!(recent[0].content, long, "full content is preserved");
+        assert!(
+            recent[0].preview.chars().count() <= 201,
+            "preview stays truncated"
+        );
+        // Search matches content past the preview cutoff.
+        assert_eq!(s.search("NEEDLE_TAIL", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_pre_content_database() {
+        // Simulate an M1-era database: clips table without a `content` column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clips (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL,
+                 preview TEXT NOT NULL,
+                 hash TEXT NOT NULL UNIQUE,
+                 created_at INTEGER NOT NULL,
+                 pinned INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO clips (kind, preview, hash, created_at, pinned)
+             VALUES ('text', 'legacy', 'h1', 100, 0);",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "clips", "content").unwrap());
+
+        // Opening through the store runs the migration.
+        let s = Store::from_conn(conn).unwrap();
+        assert!(column_exists(&s.conn, "clips", "content").unwrap());
+
+        let recent = s.recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].preview, "legacy");
+        assert_eq!(recent[0].content, "", "legacy rows get an empty content");
     }
 
     #[test]

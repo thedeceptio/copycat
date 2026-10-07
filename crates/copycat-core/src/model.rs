@@ -60,7 +60,9 @@ impl FromStr for ClipKind {
 pub struct Clip {
     pub id: i64,
     pub kind: ClipKind,
-    /// Short, human-readable text used in the list and for searching.
+    /// The full clip text, used for copy-back and searching.
+    pub content: String,
+    /// Short, human-readable text used in the list display.
     pub preview: String,
     /// Content hash used to detect duplicates.
     pub hash: String,
@@ -73,6 +75,8 @@ pub struct Clip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewClip {
     pub kind: ClipKind,
+    /// The full clip text (what copy-back restores to the clipboard).
+    pub content: String,
     pub preview: String,
     pub hash: String,
 }
@@ -82,6 +86,7 @@ impl NewClip {
     pub fn text(text: &str) -> Self {
         NewClip {
             kind: ClipKind::Text,
+            content: text.to_string(),
             preview: preview_of(text),
             hash: content_hash(ClipKind::Text, text.as_bytes()),
         }
