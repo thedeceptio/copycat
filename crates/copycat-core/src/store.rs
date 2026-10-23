@@ -164,6 +164,20 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// A cheap fingerprint of the history's state: `(row count, newest
+    /// timestamp)`.
+    ///
+    /// Comparing this between polls lets a reader notice new, removed, or
+    /// bumped clips without pulling every row.
+    pub fn revision(&self) -> Result<(usize, i64)> {
+        let newest: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(created_at), 0) FROM clips", [], |r| {
+                    r.get(0)
+                })?;
+        Ok((self.count()?, newest))
+    }
+
     /// Enforce the history cap: keep the newest `max` unpinned clips and delete
     /// older unpinned ones. Pinned clips are always kept and never counted
     /// against the cap. Returns the number removed.
@@ -328,6 +342,25 @@ mod tests {
         );
         // Search matches content past the preview cutoff.
         assert_eq!(s.search("NEEDLE_TAIL", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revision_changes_when_history_changes() {
+        let s = store();
+        assert_eq!(s.revision().unwrap(), (0, 0), "empty history");
+
+        s.insert_at(&NewClip::text("one"), 100).unwrap();
+        assert_eq!(s.revision().unwrap(), (1, 100));
+
+        let id = s.insert_at(&NewClip::text("two"), 200).unwrap();
+        assert_eq!(s.revision().unwrap(), (2, 200), "new clip moves the mark");
+
+        // A re-copy bumps an existing clip: count is unchanged, newest moves.
+        s.insert_at(&NewClip::text("one"), 300).unwrap();
+        assert_eq!(s.revision().unwrap(), (2, 300), "bump is still a change");
+
+        s.delete(id).unwrap();
+        assert_eq!(s.revision().unwrap(), (1, 300), "deletion is a change");
     }
 
     #[test]

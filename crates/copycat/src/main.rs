@@ -28,19 +28,37 @@ const HISTORY_LIMIT: usize = 500;
 /// ownership settle and the desktop's clipboard manager mirror the content.
 const CLIPBOARD_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How often the open popup checks for clips captured since it was opened.
+///
+/// The daemon writes history independently, so a popup left open would
+/// otherwise show a frozen snapshot from whenever it launched.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(700);
+
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
 const PAGE_EMPTY: &str = "empty";
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    app.connect_activate(|app| {
+        // GTK applications are single-instance: launching copycat again (e.g.
+        // pressing the hotkey) activates the running process rather than
+        // starting a new one. Raise the popup we already have instead of
+        // stacking up a fresh window every time. The refresh timer keeps its
+        // contents current, so the re-raised window is never stale.
+        if let Some(window) = app.active_window() {
+            window.present();
+            return;
+        }
+        build_ui(app);
+    });
     app.run()
 }
 
 fn build_ui(app: &adw::Application) {
-    let all: Rc<Vec<Clip>> = Rc::new(load_history());
-    let ranked: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new((*all).clone()));
+    let store: Option<Rc<Store>> = open_store().map(Rc::new);
+    let all: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new(read_history(store.as_deref())));
+    let ranked: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new(all.borrow().clone()));
 
     let entry = SearchEntry::new();
     entry.set_placeholder_text(Some("Search clipboard history…"));
@@ -90,11 +108,39 @@ fn build_ui(app: &adw::Application) {
     // Re-rank as the user types.
     entry.connect_search_changed(
         glib::clone!(@strong list, @strong stack, @strong all, @strong ranked => move |e| {
-            let results = rank(&e.text(), (*all).clone());
+            let results = rank(&e.text(), all.borrow().clone());
             populate(&list, &stack, &results);
             *ranked.borrow_mut() = results;
         }),
     );
+
+    // Pick up clips the daemon captured while this popup is open, so the list
+    // never shows a stale snapshot.
+    if let Some(store) = store.clone() {
+        let revision = Rc::new(RefCell::new(store.revision().unwrap_or_default()));
+        glib::timeout_add_local(
+            REFRESH_INTERVAL,
+            glib::clone!(
+                @strong list, @strong stack, @strong all, @strong ranked,
+                @strong entry, @strong revision, @weak window
+                => @default-return glib::ControlFlow::Break,
+                move || {
+                    if let Ok(current) = store.revision() {
+                        if current != *revision.borrow() {
+                            *revision.borrow_mut() = current;
+                            if let Ok(fresh) = store.recent(HISTORY_LIMIT) {
+                                *all.borrow_mut() = fresh;
+                                let results = rank(&entry.text(), all.borrow().clone());
+                                populate(&list, &stack, &results);
+                                *ranked.borrow_mut() = results;
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
 
     // Capture-phase key handling so Enter/arrows/Esc work while typing.
     let keys = EventControllerKey::new();
@@ -139,26 +185,35 @@ fn build_ui(app: &adw::Application) {
     entry.grab_focus();
 }
 
-/// Load recent history, returning an empty list on any error (so the popup still
-/// opens rather than crashing).
-fn load_history() -> Vec<Clip> {
+/// Open the history database, or report why we could not.
+///
+/// A failure is not fatal: the popup still opens, just with an empty list.
+fn open_store() -> Option<Store> {
     let path = match default_db_path() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("copycat: cannot locate history database: {e}");
-            return Vec::new();
+            return None;
         }
     };
     match Store::open(&path) {
-        Ok(store) => store.recent(HISTORY_LIMIT).unwrap_or_else(|e| {
-            eprintln!("copycat: failed to read history: {e}");
-            Vec::new()
-        }),
+        Ok(store) => Some(store),
         Err(e) => {
             eprintln!("copycat: failed to open history database: {e}");
-            Vec::new()
+            None
         }
     }
+}
+
+/// Read the most recent clips, falling back to an empty list on error.
+fn read_history(store: Option<&Store>) -> Vec<Clip> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    store.recent(HISTORY_LIMIT).unwrap_or_else(|e| {
+        eprintln!("copycat: failed to read history: {e}");
+        Vec::new()
+    })
 }
 
 /// Rebuild the list rows from `clips`, select the first, and show either the
