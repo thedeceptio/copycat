@@ -4,7 +4,9 @@
 //! portal hotkey lands). It loads the history written by `copycatd`, lets you
 //! fuzzy-search it, and on Enter copies the chosen clip back to the clipboard.
 
-use std::cell::RefCell;
+mod x11util;
+
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -34,13 +36,30 @@ const CLIPBOARD_SETTLE: std::time::Duration = std::time::Duration::from_millis(5
 /// otherwise show a frozen snapshot from whenever it launched.
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(700);
 
+/// Popup size. Deliberately small — this is a menu, not a window you work in.
+const POPUP_WIDTH: i32 = 420;
+const POPUP_HEIGHT: i32 = 340;
+
+/// How long to wait after hiding the popup before handing focus back and
+/// synthesizing the paste, so the window manager has settled.
+const REFOCUS_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
 const PAGE_EMPTY: &str = "empty";
 
+thread_local! {
+    /// The window that held focus when the popup was summoned — where an
+    /// auto-paste should land. Captured before we steal focus ourselves.
+    static PASTE_TARGET: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
+        // Remember where the user was working before our window takes focus.
+        PASTE_TARGET.with(|target| target.set(x11util::focused_window()));
+
         // GTK applications are single-instance: launching copycat again (e.g.
         // pressing the hotkey) activates the running process rather than
         // starting a new one. Raise the popup we already have instead of
@@ -84,24 +103,31 @@ fn build_ui(app: &adw::Application) {
     stack.add_named(&scroller, Some(PAGE_LIST));
     stack.add_named(&empty, Some(PAGE_EMPTY));
 
-    let body = GtkBox::new(Orientation::Vertical, 12);
-    body.set_margin_top(12);
-    body.set_margin_bottom(12);
-    body.set_margin_start(12);
-    body.set_margin_end(12);
+    let body = GtkBox::new(Orientation::Vertical, 8);
+    body.set_margin_top(8);
+    body.set_margin_bottom(8);
+    body.set_margin_start(8);
+    body.set_margin_end(8);
     body.append(&entry);
     body.append(&stack);
 
-    let toolbar = adw::ToolbarView::builder().content(&body).build();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-
+    // No header bar: this is a menu that appears, gets used, and disappears.
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("copycat")
-        .default_width(620)
-        .default_height(460)
+        .default_width(POPUP_WIDTH)
+        .default_height(POPUP_HEIGHT)
+        .resizable(false)
         .build();
-    window.set_content(Some(&toolbar));
+    window.set_content(Some(&body));
+
+    // GTK4 has no window-positioning API, so place it ourselves once it has an
+    // X11 surface. Off X11 this does nothing and the compositor decides.
+    window.connect_map(|window| {
+        if let Some(xid) = window_xid(window) {
+            x11util::place_at_pointer(xid, POPUP_WIDTH, POPUP_HEIGHT);
+        }
+    });
 
     populate(&list, &stack, &ranked.borrow());
 
@@ -252,12 +278,38 @@ fn move_selection(list: &ListBox, delta: i32, count: usize) {
     }
 }
 
-/// Hide the popup immediately, but let the process live just long enough for
-/// clipboard ownership to settle before quitting. See [`CLIPBOARD_SETTLE`].
+/// The popup's X11 window id, if we are running on X11.
+fn window_xid(window: &adw::ApplicationWindow) -> Option<u32> {
+    use gdk4_x11::X11Surface;
+    window
+        .surface()?
+        .downcast::<X11Surface>()
+        .ok()
+        .map(|surface| surface.xid() as u32)
+}
+
+/// Hide the popup, hand focus back to where the user came from, paste for them,
+/// and only then quit.
+///
+/// The ordering matters: we must still be alive when the target asks us for the
+/// clipboard contents, which is why the quit trails the paste rather than
+/// racing it. If anything in the X11 path is unavailable the clip is simply
+/// left on the clipboard to paste by hand.
 fn dismiss_after_copy(window: &adw::ApplicationWindow) {
     window.set_visible(false);
+    let target = PASTE_TARGET.with(|target| target.get());
     let window = window.clone();
-    glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
+
+    glib::timeout_add_local_once(REFOCUS_DELAY, move || {
+        match target {
+            Some(target) if x11util::paste_into(target).is_some() => {
+                eprintln!("copycat: pasted into window {target}");
+            }
+            Some(_) => eprintln!("copycat: could not auto-paste; clip is on the clipboard"),
+            None => eprintln!("copycat: no window to paste into; clip is on the clipboard"),
+        }
+        glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
+    });
 }
 
 /// Copy the currently selected clip's full content back to the clipboard.

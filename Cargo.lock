@@ -90,8 +90,10 @@ name = "copycat"
 version = "0.1.0"
 dependencies = [
  "copycat-core",
+ "gdk4-x11",
  "gtk4",
  "libadwaita",
+ "x11rb",
 ]
 
 [[package]]
@@ -310,6 +312,31 @@ dependencies = [
  "libc",
  "pango-sys",
  "pkg-config",
+ "system-deps",
+]
+
+[[package]]
+name = "gdk4-x11"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec6da3e3527007c14b27ddafe19496c49696a2a74dccb6ab75ba58dfa478b7ab"
+dependencies = [
+ "gdk4",
+ "gdk4-x11-sys",
+ "gio",
+ "glib",
+ "libc",
+]
+
+[[package]]
+name = "gdk4-x11-sys"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb4e987ec77b7b2fb72c0943ccbec5c3834d9d7165fe762af8ff2414f0ae23d"
+dependencies = [
+ "gdk4-sys",
+ "glib-sys",
+ "libc",
  "system-deps",
 ]
 

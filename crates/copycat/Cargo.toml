@@ -16,3 +16,6 @@ copycat-core = { workspace = true }
 # Matches the ship target (Ubuntu 24.04: GTK 4.14 / libadwaita 1.5); see SPEC §5.1.
 gtk = { package = "gtk4", version = "0.8" }
 adw = { package = "libadwaita", version = "0.6", features = ["v1_5"] }
+# X11-only: GTK4 has no window-positioning API, and pasting needs XTEST.
+gdk4-x11 = "0.8"
+x11rb = { version = "0.13", features = ["xtest"] }
