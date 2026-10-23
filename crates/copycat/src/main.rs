@@ -198,6 +198,6 @@ fn copy_selected(list: &ListBox, ranked: &[Clip]) {
         return;
     };
     if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_text(&clip.content);
+        display.clipboard().set_text(clip.text());
     }
 }

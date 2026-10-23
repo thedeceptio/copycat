@@ -50,6 +50,46 @@ To work on just the storage layer (no system libraries required):
 cargo test -p copycat-core
 ```
 
+## Running it
+
+copycat is two processes: a **daemon** that records what you copy, and a **popup**
+that lets you search and restore it. **Nothing is captured unless the daemon is
+running.**
+
+Run the daemon in a terminal:
+
+```bash
+cargo run -p copycatd
+```
+
+Then open the popup (in another terminal, or bound to a hotkey):
+
+```bash
+cargo run -p copycat
+```
+
+### Start the daemon automatically
+
+To have the daemon start with your desktop session instead:
+
+```bash
+mkdir -p ~/.local/bin ~/.config/systemd/user
+ln -sf "$PWD/target/debug/copycatd" ~/.local/bin/copycatd
+cp packaging/systemd/copycat-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now copycat-daemon
+```
+
+Check it with `systemctl --user status copycat-daemon`, and undo with
+`systemctl --user disable --now copycat-daemon`.
+
+### Hotkey
+
+Until the global-shortcut portal is wired up, bind the popup yourself:
+**Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts**, command
+`~/.local/bin/copycat` (or the absolute path to the built binary), bound to
+`Super+V`.
+
 ## License
 
 GPL-3.0-or-later.

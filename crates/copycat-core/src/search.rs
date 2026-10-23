@@ -23,7 +23,7 @@ pub fn rank(query: &str, clips: Vec<Clip>) -> Vec<Clip> {
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(i64, Clip)> = clips
         .into_iter()
-        .filter_map(|clip| matcher.fuzzy_match(&clip.content, query).map(|s| (s, clip)))
+        .filter_map(|clip| matcher.fuzzy_match(clip.text(), query).map(|s| (s, clip)))
         .collect();
 
     scored.sort_by(|a, b| {
@@ -102,6 +102,18 @@ mod tests {
             out[0].id, 2,
             "the contiguous 'cat' in 'category' outranks the scattered match"
         );
+    }
+
+    #[test]
+    fn finds_clips_whose_content_is_empty_via_preview() {
+        // Rows migrated from a pre-content database have empty content; they
+        // must still be findable through their preview.
+        let mut legacy = clip(1, "a random note about groceries", 100, false);
+        legacy.content = String::new();
+
+        let out = rank("groc", vec![legacy]);
+        assert_eq!(out.len(), 1, "legacy clip is still searchable");
+        assert_eq!(out[0].id, 1);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[Unit]
+Description=copycat clipboard capture daemon
+Documentation=https://github.com/thedeceptio/copycat
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Resolved via PATH-independent absolute path. For a development build, symlink
+# the built binary into place:
+#   ln -sf "$PWD/target/debug/copycatd" ~/.local/bin/copycatd
+# The .deb will install to /usr/bin/copycatd and ship its own unit.
+ExecStart=%h/.local/bin/copycatd
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

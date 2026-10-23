@@ -115,8 +115,11 @@ impl Store {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
         let like = format!("%{}%", escape_like(query));
         let mut stmt = self.conn.prepare(
+            // Legacy rows (migrated before content was stored) have an empty
+            // content; fall back to their preview so they stay findable.
             "SELECT id, kind, content, preview, hash, created_at, pinned FROM clips
-             WHERE content LIKE ?1 ESCAPE '\\'
+             WHERE (CASE WHEN content = '' THEN preview ELSE content END)
+                   LIKE ?1 ESCAPE '\\'
              ORDER BY pinned DESC, created_at DESC
              LIMIT ?2",
         )?;

@@ -71,6 +71,22 @@ pub struct Clip {
     pub pinned: bool,
 }
 
+impl Clip {
+    /// The clip's usable text, for both searching and copy-back.
+    ///
+    /// Normally this is the full [`Clip::content`]. Rows captured before
+    /// content was stored (migrated from an older database) have an empty
+    /// content, so we fall back to the preview — truncated, but far better than
+    /// treating the clip as empty and making it unsearchable and uncopyable.
+    pub fn text(&self) -> &str {
+        if self.content.is_empty() {
+            &self.preview
+        } else {
+            &self.content
+        }
+    }
+}
+
 /// A clip about to be inserted, before the store assigns an id/timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewClip {
@@ -152,6 +168,24 @@ mod tests {
     #[test]
     fn preview_trims_whitespace() {
         assert_eq!(preview_of("   hello \n"), "hello");
+    }
+
+    #[test]
+    fn clip_text_prefers_content_and_falls_back_to_preview() {
+        let mut clip = Clip {
+            id: 1,
+            kind: ClipKind::Text,
+            content: "the full original text".to_string(),
+            preview: "the full original".to_string(),
+            hash: "h".to_string(),
+            created_at: 0,
+            pinned: false,
+        };
+        assert_eq!(clip.text(), "the full original text");
+
+        // A migrated row with no stored content still yields usable text.
+        clip.content = String::new();
+        assert_eq!(clip.text(), "the full original");
     }
 
     #[test]
