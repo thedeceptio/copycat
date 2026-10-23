@@ -20,6 +20,14 @@ const APP_ID: &str = "dev.thedeceptio.Copycat";
 /// How many recent clips to load into the popup.
 const HISTORY_LIMIT: usize = 500;
 
+/// Grace period between putting a clip on the clipboard and quitting.
+///
+/// Taking ownership of the X11 CLIPBOARD selection is an asynchronous request.
+/// Quitting in the same breath can kill the process before that request is even
+/// flushed to the display server, so the clip never lands. Waiting a beat lets
+/// ownership settle and the desktop's clipboard manager mirror the content.
+const CLIPBOARD_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
 const PAGE_EMPTY: &str = "empty";
@@ -102,7 +110,7 @@ fn build_ui(app: &adw::Application) {
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
                     copy_selected(&list, &ranked.borrow());
-                    window.close();
+                    dismiss_after_copy(&window);
                     glib::Propagation::Stop
                 }
                 gdk::Key::Up => {
@@ -123,7 +131,7 @@ fn build_ui(app: &adw::Application) {
     list.connect_row_activated(
         glib::clone!(@strong ranked, @weak window => move |list, _| {
             copy_selected(list, &ranked.borrow());
-            window.close();
+            dismiss_after_copy(&window);
         }),
     );
 
@@ -189,15 +197,36 @@ fn move_selection(list: &ListBox, delta: i32, count: usize) {
     }
 }
 
+/// Hide the popup immediately, but let the process live just long enough for
+/// clipboard ownership to settle before quitting. See [`CLIPBOARD_SETTLE`].
+fn dismiss_after_copy(window: &adw::ApplicationWindow) {
+    window.set_visible(false);
+    let window = window.clone();
+    glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
+}
+
 /// Copy the currently selected clip's full content back to the clipboard.
 fn copy_selected(list: &ListBox, ranked: &[Clip]) {
     let Some(row) = list.selected_row() else {
+        eprintln!("copycat: nothing selected, clipboard left alone");
         return;
     };
     let Some(clip) = ranked.get(row.index() as usize) else {
+        eprintln!(
+            "copycat: selected row {} has no matching clip, clipboard left alone",
+            row.index()
+        );
         return;
     };
-    if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_text(clip.text());
+    match gdk::Display::default() {
+        Some(display) => {
+            display.clipboard().set_text(clip.text());
+            eprintln!(
+                "copycat: copied clip {} ({} chars) to the clipboard",
+                clip.id,
+                clip.text().chars().count()
+            );
+        }
+        None => eprintln!("copycat: no display, cannot set the clipboard"),
     }
 }
