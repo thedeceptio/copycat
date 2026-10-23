@@ -68,27 +68,39 @@ Then open the popup (in another terminal, or bound to a hotkey):
 cargo run -p copycat
 ```
 
-### Start the daemon automatically
+## Wiring it into your desktop
 
-To have the daemon start with your desktop session instead:
+To stop running it by hand — daemon on login, popup on `Super+V`:
 
 ```bash
-mkdir -p ~/.local/bin ~/.config/systemd/user
-ln -sf "$PWD/target/debug/copycatd" ~/.local/bin/copycatd
-cp packaging/systemd/copycat-daemon.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now copycat-daemon
+cargo build --release --workspace
+scripts/install-desktop.sh
 ```
 
-Check it with `systemctl --user status copycat-daemon`, and undo with
-`systemctl --user disable --now copycat-daemon`.
+That script links the binaries into `~/.local/bin`, enables the `copycat-daemon`
+user service, and binds `Super+V` to the popup. It prefers a release build and
+falls back to a debug one, and is safe to re-run.
 
-### Hotkey
+**One shortcut changes:** GNOME ships `Super+V` as "toggle message tray", which
+also has `Super+M`. The script takes `Super+V` and leaves `Super+M` doing the
+tray.
 
-Until the global-shortcut portal is wired up, bind the popup yourself:
-**Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts**, command
-`~/.local/bin/copycat` (or the absolute path to the built binary), bound to
-`Super+V`.
+To reverse everything (shortcut, service, symlinks — the history database is
+left alone):
+
+```bash
+scripts/install-desktop.sh --uninstall
+```
+
+Check the daemon any time with `systemctl --user status copycat-daemon`.
+
+### Using it
+
+1. Copy things normally — the daemon records them.
+2. Press `Super+V` to open the popup.
+3. Type to fuzzy-search, or use `Up`/`Down`.
+4. `Enter` copies the clip and closes the popup; `Esc` dismisses it.
+5. Paste with `Ctrl+V`.
 
 ## License
 
