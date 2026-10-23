@@ -10,7 +10,8 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Pinned to the ship target (GTK 4.14 / libadwaita 1.5), matching the dev machine.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

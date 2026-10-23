@@ -1,34 +1,36 @@
-//! copycat — the GTK4 clipboard-history popup.
+//! copycat — the GTK4 / libadwaita clipboard-history popup.
 //!
 //! Launched on a hotkey (bind `Super+V` to `copycat` in GNOME Settings until the
 //! portal hotkey lands). It loads the history written by `copycatd`, lets you
 //! fuzzy-search it, and on Enter copies the chosen clip back to the clipboard.
-//! Plain GTK4 for now; libadwaita styling is deferred (see SPEC §5.1).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use adw::prelude::*;
 use copycat_core::model::one_line;
 use copycat_core::{default_db_path, rank, Clip, Store};
-use gtk::gdk;
-use gtk::glib;
-use gtk::prelude::*;
+use gtk::{gdk, glib};
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, EventControllerKey, Inhibit, Label, ListBox,
-    Orientation, PropagationPhase, ScrolledWindow, SearchEntry,
+    Box as GtkBox, EventControllerKey, ListBox, Orientation, PropagationPhase, ScrolledWindow,
+    SearchEntry, Stack,
 };
 
 const APP_ID: &str = "dev.thedeceptio.Copycat";
 /// How many recent clips to load into the popup.
 const HISTORY_LIMIT: usize = 500;
 
-fn main() {
-    let app = Application::builder().application_id(APP_ID).build();
+/// Names of the [`Stack`] pages, so we can swap list vs. empty state.
+const PAGE_LIST: &str = "list";
+const PAGE_EMPTY: &str = "empty";
+
+fn main() -> glib::ExitCode {
+    let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
-    let _ = app.run();
+    app.run()
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &adw::Application) {
     let all: Rc<Vec<Clip>> = Rc::new(load_history());
     let ranked: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new((*all).clone()));
 
@@ -37,6 +39,7 @@ fn build_ui(app: &Application) {
 
     let list = ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
+    list.add_css_class("boxed-list");
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -44,30 +47,43 @@ fn build_ui(app: &Application) {
         .child(&list)
         .build();
 
-    let layout = GtkBox::new(Orientation::Vertical, 6);
-    layout.set_margin_top(8);
-    layout.set_margin_bottom(8);
-    layout.set_margin_start(8);
-    layout.set_margin_end(8);
-    layout.append(&entry);
-    layout.append(&scroller);
+    let empty = adw::StatusPage::builder()
+        .icon_name("edit-paste-symbolic")
+        .title("No clips")
+        .description("Copy something and it will show up here.")
+        .vexpand(true)
+        .build();
 
-    let window = ApplicationWindow::builder()
+    let stack = Stack::new();
+    stack.add_named(&scroller, Some(PAGE_LIST));
+    stack.add_named(&empty, Some(PAGE_EMPTY));
+
+    let body = GtkBox::new(Orientation::Vertical, 12);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.append(&entry);
+    body.append(&stack);
+
+    let toolbar = adw::ToolbarView::builder().content(&body).build();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+
+    let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("copycat")
-        .default_width(600)
-        .default_height(420)
+        .default_width(620)
+        .default_height(460)
         .build();
-    window.set_child(Some(&layout));
+    window.set_content(Some(&toolbar));
 
-    populate(&list, &ranked.borrow());
+    populate(&list, &stack, &ranked.borrow());
 
     // Re-rank as the user types.
     entry.connect_search_changed(
-        glib::clone!(@strong list, @strong all, @strong ranked => move |e| {
-            let query = e.text().to_string();
-            let results = rank(&query, (*all).clone());
-            populate(&list, &results);
+        glib::clone!(@strong list, @strong stack, @strong all, @strong ranked => move |e| {
+            let results = rank(&e.text(), (*all).clone());
+            populate(&list, &stack, &results);
             *ranked.borrow_mut() = results;
         }),
     );
@@ -75,31 +91,35 @@ fn build_ui(app: &Application) {
     // Capture-phase key handling so Enter/arrows/Esc work while typing.
     let keys = EventControllerKey::new();
     keys.set_propagation_phase(PropagationPhase::Capture);
-    keys.connect_key_pressed(glib::clone!(@strong list, @strong ranked, @weak window => @default-return Inhibit(false), move |_, key, _, _| {
-        match key {
-            gdk::Key::Escape => {
-                window.close();
-                Inhibit(true)
+    keys.connect_key_pressed(glib::clone!(
+        @strong list, @strong ranked, @weak window
+        => @default-return glib::Propagation::Proceed,
+        move |_, key, _, _| {
+            match key {
+                gdk::Key::Escape => {
+                    window.close();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    copy_selected(&list, &ranked.borrow());
+                    window.close();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Up => {
+                    move_selection(&list, -1, ranked.borrow().len());
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Down => {
+                    move_selection(&list, 1, ranked.borrow().len());
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
             }
-            gdk::Key::Return | gdk::Key::KP_Enter => {
-                copy_selected(&list, &ranked.borrow());
-                window.close();
-                Inhibit(true)
-            }
-            gdk::Key::Up => {
-                move_selection(&list, -1, ranked.borrow().len());
-                Inhibit(true)
-            }
-            gdk::Key::Down => {
-                move_selection(&list, 1, ranked.borrow().len());
-                Inhibit(true)
-            }
-            _ => Inhibit(false),
         }
-    }));
-    window.add_controller(&keys);
+    ));
+    window.add_controller(keys);
 
-    // Double-click / activate a row copies it too.
+    // Clicking a row copies it too.
     list.connect_row_activated(
         glib::clone!(@strong ranked, @weak window => move |list, _| {
             copy_selected(list, &ranked.borrow());
@@ -133,24 +153,27 @@ fn load_history() -> Vec<Clip> {
     }
 }
 
-/// Rebuild the list rows from `clips` and select the first.
-fn populate(list: &ListBox, clips: &[Clip]) {
+/// Rebuild the list rows from `clips`, select the first, and show either the
+/// list or the empty state.
+fn populate(list: &ListBox, stack: &Stack, clips: &[Clip]) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     for clip in clips {
-        let label = Label::new(Some(&one_line(&clip.preview)));
-        label.set_xalign(0.0);
-        label.set_margin_top(4);
-        label.set_margin_bottom(4);
-        label.set_margin_start(6);
-        label.set_margin_end(6);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        list.append(&label);
+        let row = adw::ActionRow::new();
+        // Clip text is arbitrary user data, never Pango markup.
+        row.set_use_markup(false);
+        row.set_title(&one_line(&clip.preview));
+        list.append(&row);
     }
     if let Some(row) = list.row_at_index(0) {
         list.select_row(Some(&row));
     }
+    stack.set_visible_child_name(if clips.is_empty() {
+        PAGE_EMPTY
+    } else {
+        PAGE_LIST
+    });
 }
 
 /// Move the selection by `delta`, clamped to `[0, count)`, keeping it in view.

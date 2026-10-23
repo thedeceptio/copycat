@@ -99,14 +99,15 @@ compile-time safety, no GC, ~5–15 MB resident). Python's clean path forces she
 small contributor pool and more manual Wayland interop. Rust's one real cost — slower to write —
 is a one-time expense against a long-lived daemon.
 
-- **UI toolkit:** `gtk4-rs` + `libadwaita` bindings.
-  - **M2 dev toolchain — LOCKED: native host, bindings pinned to the host GTK.** The dev
-    machine is jammy (GTK 4.6 / libadwaita 1.1), so the Rust bindings are pinned down to match
-    (older `gtk4`/`libadwaita` crate versions) and the GUI is built/run natively — no container.
-    The ship target stays 24.04+ (GTK 4.14 / libadwaita 1.5); older bindings are forward-
-    compatible, so the same code builds on the newer target and in CI. Trade-off accepted:
-    dated bindings now in exchange for the simplest native loop; modern-binding uplift is
-    deferred. (Docker-24.04 was the considered alternative; rejected for setup overhead.)
+- **UI toolkit:** `gtk4-rs` + `libadwaita`, built natively — **LOCKED (revised 2026-10-23).**
+  The dev machine was upgraded from jammy to **Ubuntu 24.04 (noble): GTK 4.14.5 /
+  libadwaita 1.5.0**, i.e. the ship target itself. Bindings are therefore **modern**:
+  `gtk4` 0.8 and `libadwaita` 0.6 with the `v1_5` feature. Dev machine == CI == ship target,
+  so there is no binding compromise and no container.
+
+  *Superseded:* the earlier jammy-era decisions to pin bindings down to GTK 4.6 and to defer
+  libadwaita were both driven purely by the old OS and no longer apply; the Docker-24.04
+  alternative is moot for the same reason.
 - **Wayland clipboard:** `wayland-client` + protocol bindings generated from `wlr-data-control` XML.
 - **X11 fallback:** XFixes clipboard notifications.
 - **Storage:** SQLite (`rusqlite`) for metadata + text; image blobs on disk referenced by hash (`sha2`).
@@ -188,19 +189,21 @@ independently demoable.
 - systemd user service + autostart on login; **`.deb` + PPA** packaging.
 - **Demo:** `apt install`, log in, it just works. **Exit criteria:** all §7 success criteria met.
 
-**Platform reality & risks (discovered 2026-09-29)**
-- **Dev machine is Ubuntu 22.04 (jammy), GNOME 42, running an X11 session.** Its GTK4 (4.6)
-  and libadwaita (1.1) are too old for modern Rust bindings; libadwaita work needs a newer
-  runtime (24.04+ target, or a distrobox/Flatpak SDK for local GUI dev). This affects M2, not M1.
-- **Backend order flipped to X11-first.** Because the dev session is X11, the X11/XFixes
-  capture path is built and validated first (pure-Rust `x11rb`, no system `-dev` libs). The
-  Wayland backend follows.
-- **GNOME + Wayland clipboard-watch is a real risk for the P0 daemon.** GNOME/Mutter did not
-  implement `wlr-data-control`; background clipboard watching relies on the newer
-  `ext-data-control-v1`, which only landed in Mutter 47+ (GNOME 47+). Ubuntu 24.04 LTS ships
-  GNOME 46, so the target may lack it — the Wayland backend must detect `ext-data-control`
-  availability and, where absent, fall back (revisit: a minimal GNOME Shell helper, or document
-  Wayland support as GNOME 47+/KDE/wlroots for now). To be resolved before/at the Wayland backend.
+**Platform reality & risks (updated 2026-10-23)**
+- **Dev machine is Ubuntu 24.04.5 (noble), GNOME Shell 46, running an X11 session**
+  (upgraded from jammy on 2026-10-23). GTK 4.14.5 / libadwaita 1.5.0 — the ship target itself,
+  so the GUI is built natively against modern bindings (see §5.1). The earlier jammy-era
+  constraints (GTK 4.6 / libadwaita 1.1, container workarounds) no longer apply.
+- **Backend order is X11-first.** The dev session is X11, so the X11/XFixes capture path is
+  built and validated first (pure-Rust `x11rb`, no system `-dev` libs). The Wayland backend
+  follows and is still unimplemented.
+- **GNOME + Wayland clipboard-watch remains the biggest open risk for the P0 daemon.**
+  GNOME/Mutter never implemented `wlr-data-control`; background clipboard watching relies on
+  `ext-data-control-v1`, which landed only in Mutter 47+ (GNOME 47+). **Confirmed: this machine
+  runs GNOME 46, so it is unavailable here** — as is the case for Ubuntu 24.04 LTS generally.
+  The Wayland backend must detect `ext-data-control` at runtime and, where absent, fall back
+  (revisit: a minimal GNOME Shell helper, or document Wayland support as GNOME 47+/KDE/wlroots).
+  Not blocking today because the dev session is X11.
 
 **Sequencing notes**
 - M1→M2 is the critical path; everything else layers on the store + IPC they establish.

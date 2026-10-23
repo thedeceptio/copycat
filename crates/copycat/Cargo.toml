@@ -13,6 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 copycat-core = { workspace = true }
-# Bindings pinned to the host GTK (4.6) / libadwaita (1.1); see SPEC §5.1.
-# libadwaita is added back once the plain-GTK toolchain is validated.
-gtk = { package = "gtk4", version = "0.5" }
+# Matches the ship target (Ubuntu 24.04: GTK 4.14 / libadwaita 1.5); see SPEC §5.1.
+gtk = { package = "gtk4", version = "0.8" }
+adw = { package = "libadwaita", version = "0.6", features = ["v1_5"] }
