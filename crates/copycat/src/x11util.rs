@@ -15,8 +15,7 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus, Window,
-    KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    AtomEnum, ConfigureWindowAux, ConnectionExt as _, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -48,11 +47,6 @@ const KEY_DELAY_MS: u32 = 12;
 /// Margin kept between the popup and the screen edge, in pixels.
 const SCREEN_MARGIN: i32 = 8;
 
-/// "Pager" source indication for `_NET_ACTIVE_WINDOW`, which asks the window
-/// manager to honour the request rather than applying focus-stealing
-/// prevention as it would for a normal application.
-const SOURCE_PAGER: u32 = 2;
-
 /// A short-lived X11 connection. Returns `None` off X11 (e.g. on Wayland).
 fn connect() -> Option<(RustConnection, usize)> {
     x11rb::connect(None).ok()
@@ -62,16 +56,51 @@ fn intern(conn: &impl Connection, name: &[u8]) -> Option<u32> {
     Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
 }
 
-/// The window that currently holds input focus, i.e. where the user was typing
-/// before the popup appeared.
-pub fn focused_window() -> Option<Window> {
-    let (conn, _) = connect()?;
-    let focus = conn.get_input_focus().ok()?.reply().ok()?.focus;
-    // PointerRoot (1) and None are not windows we can hand focus back to.
-    if focus == x11rb::NONE || focus == 1 {
-        return None;
+/// The toplevel window the window manager considers active.
+///
+/// This is deliberately *not* `GetInputFocus`: that reports whichever window
+/// holds focus, which for many toolkits is an internal child with no name that
+/// the window manager does not manage. Acting on it means targeting the wrong
+/// window. `_NET_ACTIVE_WINDOW` is the window manager's own answer to "where is
+/// the user working", which is what we actually want.
+pub fn active_window() -> Option<Window> {
+    let (conn, screen_num) = connect()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let atom = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
+    let reply = conn
+        .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let window = reply.value32()?.next()?;
+    (window != x11rb::NONE).then_some(window)
+}
+
+/// A human-readable label for `window`, for diagnostics only.
+pub fn window_label(window: Window) -> String {
+    let Some((conn, _)) = connect() else {
+        return "<no display>".to_string();
+    };
+    let class = intern(&conn, b"WM_CLASS")
+        .and_then(|atom| {
+            conn.get_property(false, window, atom, AtomEnum::STRING, 0, 64)
+                .ok()?
+                .reply()
+                .ok()
+        })
+        .map(|reply| {
+            String::from_utf8_lossy(&reply.value)
+                .split('\0')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .unwrap_or_default();
+    if class.is_empty() {
+        format!("{window} <unnamed>")
+    } else {
+        format!("{window} ({class})")
     }
-    Some(focus)
 }
 
 /// Whoever currently owns the CLIPBOARD selection, if anyone.
@@ -131,35 +160,6 @@ pub fn clamp_to_screen(
     let max_x = (screen_w - width - SCREEN_MARGIN).max(SCREEN_MARGIN);
     let max_y = (screen_h - height - SCREEN_MARGIN).max(SCREEN_MARGIN);
     (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
-}
-
-/// Hand the keyboard back to `target`.
-///
-/// Asks the window manager first via `_NET_ACTIVE_WINDOW` — the cooperative
-/// route a compositing WM like Mutter respects — then sets input focus
-/// directly as a fallback for anything that ignores the message.
-pub fn focus_window(target: Window) -> Option<()> {
-    let (conn, screen_num) = connect()?;
-    let root = conn.setup().roots.get(screen_num)?.root;
-
-    if let Some(active) = intern(&conn, b"_NET_ACTIVE_WINDOW") {
-        let event = ClientMessageEvent::new(
-            32,
-            target,
-            active,
-            [SOURCE_PAGER, x11rb::CURRENT_TIME, 0, 0, 0],
-        );
-        let _ = conn.send_event(
-            false,
-            root,
-            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-            event,
-        );
-    }
-
-    let _ = conn.set_input_focus(InputFocus::PARENT, target, x11rb::CURRENT_TIME);
-    conn.flush().ok()?;
-    Some(())
 }
 
 /// Synthesize `Ctrl+V` into whatever currently holds focus.

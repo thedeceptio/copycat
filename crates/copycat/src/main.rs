@@ -44,12 +44,11 @@ const POPUP_HEIGHT: i32 = 340;
 const OWNERSHIP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Give up waiting for the clipboard claim after this long and paste anyway.
 const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
-/// Breathing room after handing focus back, before the synthetic keystroke.
-///
-/// Electron/Chromium targets need a moment to re-establish their internal
-/// focus after regaining the X focus, or the keystroke arrives before any text
-/// field is listening.
-const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(220);
+/// How often to check whether the window manager has re-activated the window
+/// the user came from.
+const FOCUS_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Give up waiting for focus to leave the popup after this long.
+const FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(700);
 
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
@@ -65,7 +64,7 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
         // Remember where the user was working before our window takes focus.
-        PASTE_TARGET.with(|target| target.set(x11util::focused_window()));
+        PASTE_TARGET.with(|target| target.set(x11util::active_window()));
 
         // GTK applications are single-instance: launching copycat again (e.g.
         // pressing the hotkey) activates the running process rather than
@@ -332,34 +331,58 @@ fn dismiss_after_copy(window: &adw::ApplicationWindow, previous_owner: Option<u3
     });
 }
 
-/// Return focus to `target`, synthesize the paste, then close once the target
-/// has had a chance to read the clipboard from us.
-fn paste_and_quit(window: &adw::ApplicationWindow, target: Option<u32>) {
-    let Some(target) = target else {
-        eprintln!("copycat: no window to paste into; clip is on the clipboard");
+/// Wait for the window manager to hand focus back, then synthesize the paste
+/// and close once the target has had a chance to read the clipboard from us.
+///
+/// We deliberately do not force focus ourselves. Hiding the popup already makes
+/// Mutter re-activate whatever the user was working in, and intervening only
+/// risks pointing at an internal child window and breaking the restoration the
+/// window manager performed correctly. So we watch `_NET_ACTIVE_WINDOW` until
+/// it is something other than us, and type into that.
+fn paste_and_quit(window: &adw::ApplicationWindow, expected: Option<u32>) {
+    let ours = window_xid(window);
+    let window = window.clone();
+    let waited = Rc::new(Cell::new(std::time::Duration::ZERO));
+
+    glib::timeout_add_local(FOCUS_POLL, move || {
+        let active = x11util::active_window();
+        let restored = active.is_some() && active != ours;
+        let elapsed = waited.get() + FOCUS_POLL;
+        waited.set(elapsed);
+
+        if !restored && elapsed < FOCUS_TIMEOUT {
+            return glib::ControlFlow::Continue;
+        }
+
+        match active {
+            Some(active) if restored => {
+                if expected.is_some() && expected != Some(active) {
+                    // Not fatal: the popup may simply have been summoned from a
+                    // child window of this same application.
+                    eprintln!(
+                        "copycat: focus returned to {} (expected {:?})",
+                        x11util::window_label(active),
+                        expected
+                    );
+                }
+                match x11util::send_paste() {
+                    Some(()) => {
+                        eprintln!("copycat: pasted into {}", x11util::window_label(active))
+                    }
+                    None => {
+                        eprintln!("copycat: could not synthesize paste; clip is on the clipboard")
+                    }
+                }
+            }
+            _ => eprintln!(
+                "copycat: focus never left the popup; skipping auto-paste, \
+                 clip is on the clipboard"
+            ),
+        }
+
         let window = window.clone();
         glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
-        return;
-    };
-
-    x11util::focus_window(target);
-    let window = window.clone();
-
-    glib::timeout_add_local_once(FOCUS_SETTLE, move || {
-        let focused = x11util::focused_window();
-        if focused == Some(target) {
-            match x11util::send_paste() {
-                Some(()) => eprintln!("copycat: pasted into window {target}"),
-                None => eprintln!("copycat: could not synthesize paste; clip is on the clipboard"),
-            }
-        } else {
-            // Pasting now would type into whatever stole focus instead.
-            eprintln!(
-                "copycat: focus is {focused:?}, not the expected {target}; \
-                 skipping auto-paste, clip is on the clipboard"
-            );
-        }
-        glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
+        glib::ControlFlow::Break
     });
 }
 
