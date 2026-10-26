@@ -40,9 +40,12 @@ const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(7
 const POPUP_WIDTH: i32 = 420;
 const POPUP_HEIGHT: i32 = 340;
 
-/// How long to wait after hiding the popup before handing focus back and
-/// synthesizing the paste, so the window manager has settled.
-const REFOCUS_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+/// How often to check whether our clipboard claim has landed.
+const OWNERSHIP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+/// Give up waiting for the clipboard claim after this long and paste anyway.
+const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+/// Breathing room after handing focus back, before the synthetic keystroke.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(140);
 
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
@@ -181,8 +184,9 @@ fn build_ui(app: &adw::Application) {
                     glib::Propagation::Stop
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
-                    copy_selected(&list, &ranked.borrow());
-                    dismiss_after_copy(&window);
+                    if let Some(previous) = copy_selected(&list, &ranked.borrow()) {
+                        dismiss_after_copy(&window, previous);
+                    }
                     glib::Propagation::Stop
                 }
                 gdk::Key::Up => {
@@ -202,8 +206,9 @@ fn build_ui(app: &adw::Application) {
     // Clicking a row copies it too.
     list.connect_row_activated(
         glib::clone!(@strong ranked, @weak window => move |list, _| {
-            copy_selected(list, &ranked.borrow());
-            dismiss_after_copy(&window);
+            if let Some(previous) = copy_selected(list, &ranked.borrow()) {
+                dismiss_after_copy(&window, previous);
+            }
         }),
     );
 
@@ -288,52 +293,99 @@ fn window_xid(window: &adw::ApplicationWindow) -> Option<u32> {
         .map(|surface| surface.xid() as u32)
 }
 
-/// Hide the popup, hand focus back to where the user came from, paste for them,
-/// and only then quit.
+/// Hide the popup, wait until the clipboard really is ours, hand focus back to
+/// where the user came from, paste for them, and only then quit.
 ///
-/// The ordering matters: we must still be alive when the target asks us for the
-/// clipboard contents, which is why the quit trails the paste rather than
-/// racing it. If anything in the X11 path is unavailable the clip is simply
-/// left on the clipboard to paste by hand.
-fn dismiss_after_copy(window: &adw::ApplicationWindow) {
+/// The ordering is the whole point. Claiming the X11 selection is asynchronous:
+/// pasting too early makes the target app ask for a clipboard we do not own yet
+/// and receive nothing. So rather than guessing a delay we watch for the
+/// selection owner to change away from `previous_owner`, which is the moment
+/// our content became available. We also stay alive past the keystroke, since
+/// the target reads the clipboard *from us*.
+///
+/// If any step is unavailable the clip is still on the clipboard to paste by
+/// hand, which is the pre-existing behaviour.
+fn dismiss_after_copy(window: &adw::ApplicationWindow, previous_owner: Option<u32>) {
     window.set_visible(false);
     let target = PASTE_TARGET.with(|target| target.get());
     let window = window.clone();
+    let waited = Rc::new(Cell::new(std::time::Duration::ZERO));
 
-    glib::timeout_add_local_once(REFOCUS_DELAY, move || {
-        match target {
-            Some(target) if x11util::paste_into(target).is_some() => {
-                eprintln!("copycat: pasted into window {target}");
+    glib::timeout_add_local(OWNERSHIP_POLL, move || {
+        let ours = x11util::clipboard_owner() != previous_owner;
+        let elapsed = waited.get() + OWNERSHIP_POLL;
+        waited.set(elapsed);
+
+        if !ours && elapsed < OWNERSHIP_TIMEOUT {
+            return glib::ControlFlow::Continue;
+        }
+        if !ours {
+            eprintln!("copycat: clipboard ownership did not settle; pasting anyway");
+        }
+
+        paste_and_quit(&window, target);
+        glib::ControlFlow::Break
+    });
+}
+
+/// Return focus to `target`, synthesize the paste, then close once the target
+/// has had a chance to read the clipboard from us.
+fn paste_and_quit(window: &adw::ApplicationWindow, target: Option<u32>) {
+    let Some(target) = target else {
+        eprintln!("copycat: no window to paste into; clip is on the clipboard");
+        let window = window.clone();
+        glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
+        return;
+    };
+
+    x11util::focus_window(target);
+    let window = window.clone();
+
+    glib::timeout_add_local_once(FOCUS_SETTLE, move || {
+        let focused = x11util::focused_window();
+        if focused == Some(target) {
+            match x11util::send_paste() {
+                Some(()) => eprintln!("copycat: pasted into window {target}"),
+                None => eprintln!("copycat: could not synthesize paste; clip is on the clipboard"),
             }
-            Some(_) => eprintln!("copycat: could not auto-paste; clip is on the clipboard"),
-            None => eprintln!("copycat: no window to paste into; clip is on the clipboard"),
+        } else {
+            // Pasting now would type into whatever stole focus instead.
+            eprintln!(
+                "copycat: focus is {focused:?}, not the expected {target}; \
+                 skipping auto-paste, clip is on the clipboard"
+            );
         }
         glib::timeout_add_local_once(CLIPBOARD_SETTLE, move || window.close());
     });
 }
 
 /// Copy the currently selected clip's full content back to the clipboard.
-fn copy_selected(list: &ListBox, ranked: &[Clip]) {
-    let Some(row) = list.selected_row() else {
+///
+/// Returns whoever owned the clipboard beforehand, so the caller can tell when
+/// our own claim has taken effect. `None` means nothing was copied.
+fn copy_selected(list: &ListBox, ranked: &[Clip]) -> Option<Option<u32>> {
+    let row = list.selected_row().or_else(|| {
         eprintln!("copycat: nothing selected, clipboard left alone");
-        return;
-    };
-    let Some(clip) = ranked.get(row.index() as usize) else {
+        None
+    })?;
+    let clip = ranked.get(row.index() as usize).or_else(|| {
         eprintln!(
             "copycat: selected row {} has no matching clip, clipboard left alone",
             row.index()
         );
-        return;
-    };
-    match gdk::Display::default() {
-        Some(display) => {
-            display.clipboard().set_text(clip.text());
-            eprintln!(
-                "copycat: copied clip {} ({} chars) to the clipboard",
-                clip.id,
-                clip.text().chars().count()
-            );
-        }
-        None => eprintln!("copycat: no display, cannot set the clipboard"),
-    }
+        None
+    })?;
+    let display = gdk::Display::default().or_else(|| {
+        eprintln!("copycat: no display, cannot set the clipboard");
+        None
+    })?;
+
+    let previous_owner = x11util::clipboard_owner();
+    display.clipboard().set_text(clip.text());
+    eprintln!(
+        "copycat: copied clip {} ({} chars) to the clipboard",
+        clip.id,
+        clip.text().chars().count()
+    );
+    Some(previous_owner)
 }

@@ -1,19 +1,22 @@
 //! X11-specific helpers the popup needs and GTK4 cannot provide.
 //!
-//! Two things live here:
+//! Three things live here:
 //!
 //! * **Placing the popup.** GTK4 deliberately removed window positioning, so to
 //!   open next to the pointer we move our own toplevel through X11 directly.
 //! * **Pasting for you.** After putting a clip on the clipboard we hand focus
 //!   back to the window you came from and synthesize `Ctrl+V` via XTEST.
+//! * **Knowing when the clipboard is really ours.** Claiming the selection is
+//!   asynchronous; pasting before it completes gets the target nothing.
 //!
-//! All of this is X11-only. On Wayland neither is permitted this way, so every
-//! entry point degrades to a no-op and the popup falls back to "copy, you
-//! paste" — see SPEC §5.2.
+//! All of this is X11-only. On Wayland neither positioning nor synthetic input
+//! is permitted this way, so every entry point degrades to a no-op and the
+//! popup falls back to "copy, you paste" — see SPEC §5.2.
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConfigureWindowAux, ConnectionExt as _, InputFocus, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, InputFocus, Window,
+    KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -26,9 +29,18 @@ const KEYSYM_CONTROL_L: u32 = 0xffe3;
 /// Margin kept between the popup and the screen edge, in pixels.
 const SCREEN_MARGIN: i32 = 8;
 
+/// "Pager" source indication for `_NET_ACTIVE_WINDOW`, which asks the window
+/// manager to honour the request rather than applying focus-stealing
+/// prevention as it would for a normal application.
+const SOURCE_PAGER: u32 = 2;
+
 /// A short-lived X11 connection. Returns `None` off X11 (e.g. on Wayland).
 fn connect() -> Option<(RustConnection, usize)> {
     x11rb::connect(None).ok()
+}
+
+fn intern(conn: &impl Connection, name: &[u8]) -> Option<u32> {
+    Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
 }
 
 /// The window that currently holds input focus, i.e. where the user was typing
@@ -36,25 +48,41 @@ fn connect() -> Option<(RustConnection, usize)> {
 pub fn focused_window() -> Option<Window> {
     let (conn, _) = connect()?;
     let focus = conn.get_input_focus().ok()?.reply().ok()?.focus;
-    // PointerRoot/None are not real windows we can hand focus back to.
+    // PointerRoot (1) and None are not windows we can hand focus back to.
     if focus == x11rb::NONE || focus == 1 {
         return None;
     }
     Some(focus)
 }
 
-/// Move `xid` so a `width` x `height` popup sits just below-right of the
-/// pointer, nudged back on-screen if that would overflow.
+/// Whoever currently owns the CLIPBOARD selection, if anyone.
+///
+/// Used to tell when our own clipboard claim has actually landed: the owner
+/// changing away from whoever held it before means the X server has processed
+/// our request and a paste will now find our content.
+pub fn clipboard_owner() -> Option<Window> {
+    let (conn, _) = connect()?;
+    let clipboard = intern(&conn, b"CLIPBOARD")?;
+    let owner = conn
+        .get_selection_owner(clipboard)
+        .ok()?
+        .reply()
+        .ok()?
+        .owner;
+    (owner != x11rb::NONE).then_some(owner)
+}
+
+/// Move `xid` so a `width` x `height` popup sits at the pointer, nudged back
+/// on-screen if that would overflow.
 pub fn place_at_pointer(xid: u32, width: i32, height: i32) -> Option<()> {
     let (conn, screen_num) = connect()?;
     let screen = conn.setup().roots.get(screen_num)?;
-    let root = screen.root;
     let (screen_w, screen_h) = (
         screen.width_in_pixels as i32,
         screen.height_in_pixels as i32,
     );
 
-    let pointer = conn.query_pointer(root).ok()?.reply().ok()?;
+    let pointer = conn.query_pointer(screen.root).ok()?.reply().ok()?;
     let (x, y) = clamp_to_screen(
         pointer.root_x as i32,
         pointer.root_y as i32,
@@ -86,22 +114,45 @@ pub fn clamp_to_screen(
     (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
 }
 
-/// Give `target` focus again and synthesize `Ctrl+V` into it.
+/// Hand the keyboard back to `target`.
 ///
-/// Returns `None` if anything along the way is unavailable, in which case the
-/// clip is still on the clipboard for the user to paste themselves.
-pub fn paste_into(target: Window) -> Option<()> {
+/// Asks the window manager first via `_NET_ACTIVE_WINDOW` — the cooperative
+/// route a compositing WM like Mutter respects — then sets input focus
+/// directly as a fallback for anything that ignores the message.
+pub fn focus_window(target: Window) -> Option<()> {
+    let (conn, screen_num) = connect()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+
+    if let Some(active) = intern(&conn, b"_NET_ACTIVE_WINDOW") {
+        let event = ClientMessageEvent::new(
+            32,
+            target,
+            active,
+            [SOURCE_PAGER, x11rb::CURRENT_TIME, 0, 0, 0],
+        );
+        let _ = conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            event,
+        );
+    }
+
+    let _ = conn.set_input_focus(InputFocus::PARENT, target, x11rb::CURRENT_TIME);
+    conn.flush().ok()?;
+    Some(())
+}
+
+/// Synthesize `Ctrl+V` into whatever currently holds focus.
+///
+/// Returns `None` if XTEST or the keymap lookup is unavailable, in which case
+/// the clip is still on the clipboard for the user to paste themselves.
+pub fn send_paste() -> Option<()> {
     let (conn, screen_num) = connect()?;
     let root = conn.setup().roots.get(screen_num)?.root;
 
     let ctrl = keycode_for(&conn, KEYSYM_CONTROL_L)?;
     let v = keycode_for(&conn, KEYSYM_V)?;
-
-    // Hand the keyboard back to where the user was working first; otherwise the
-    // synthetic keys land on whatever has focus now.
-    conn.set_input_focus(InputFocus::PARENT, target, x11rb::CURRENT_TIME)
-        .ok()?;
-    conn.flush().ok()?;
 
     for (event, keycode) in [
         (KEY_PRESS_EVENT, ctrl),
