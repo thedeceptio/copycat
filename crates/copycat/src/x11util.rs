@@ -26,6 +26,25 @@ const KEYSYM_V: u32 = 0x0076;
 /// X11 keysym for the left Control modifier.
 const KEYSYM_CONTROL_L: u32 = 0xffe3;
 
+/// Modifiers that must not be held when we synthesize `Ctrl+V`: a stuck Super
+/// (from the hotkey that summoned us) or Shift turns the combination into
+/// something the target will not treat as paste. Each entry is the mask bit
+/// reported by the server and the keysym to release.
+const MODIFIERS_TO_CLEAR: [(u16, u32); 4] = [
+    (0x0001, 0xffe1), // Shift   -> Shift_L
+    (0x0004, 0xffe3), // Control -> Control_L
+    (0x0008, 0xffe9), // Mod1    -> Alt_L
+    (0x0040, 0xffeb), // Mod4    -> Super_L
+];
+
+/// Delay in milliseconds attached to each synthesized key event.
+///
+/// XTEST delivers events as fast as we queue them, which puts the whole
+/// press/release sequence in a single instant. Chromium-based apps in
+/// particular can miss a combination delivered that way, so the events are
+/// spaced out the way a real keyboard would produce them.
+const KEY_DELAY_MS: u32 = 12;
+
 /// Margin kept between the popup and the screen edge, in pixels.
 const SCREEN_MARGIN: i32 = 8;
 
@@ -154,13 +173,28 @@ pub fn send_paste() -> Option<()> {
     let ctrl = keycode_for(&conn, KEYSYM_CONTROL_L)?;
     let v = keycode_for(&conn, KEYSYM_V)?;
 
+    // Whatever the user was holding (very likely Super, which summoned us) is
+    // still part of the modifier state and would corrupt the combination.
+    let held = u16::from(conn.query_pointer(root).ok()?.reply().ok()?.mask);
+    if held != 0 {
+        eprintln!("copycat: clearing held modifiers (mask {held:#06x}) before pasting");
+    }
+    for (bit, keysym) in MODIFIERS_TO_CLEAR {
+        if held & bit != 0 {
+            if let Some(keycode) = keycode_for(&conn, keysym) {
+                let _ =
+                    conn.xtest_fake_input(KEY_RELEASE_EVENT, keycode, KEY_DELAY_MS, root, 0, 0, 0);
+            }
+        }
+    }
+
     for (event, keycode) in [
         (KEY_PRESS_EVENT, ctrl),
         (KEY_PRESS_EVENT, v),
         (KEY_RELEASE_EVENT, v),
         (KEY_RELEASE_EVENT, ctrl),
     ] {
-        conn.xtest_fake_input(event, keycode, 0, root, 0, 0, 0)
+        conn.xtest_fake_input(event, keycode, KEY_DELAY_MS, root, 0, 0, 0)
             .ok()?;
     }
     conn.flush().ok()?;

@@ -45,7 +45,11 @@ const OWNERSHIP_POLL: std::time::Duration = std::time::Duration::from_millis(20)
 /// Give up waiting for the clipboard claim after this long and paste anyway.
 const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
 /// Breathing room after handing focus back, before the synthetic keystroke.
-const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(140);
+///
+/// Electron/Chromium targets need a moment to re-establish their internal
+/// focus after regaining the X focus, or the keystroke arrives before any text
+/// field is listening.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(220);
 
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
