@@ -15,7 +15,8 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt as _, Window, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, Window,
+    KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -160,6 +161,46 @@ pub fn clamp_to_screen(
     let max_x = (screen_w - width - SCREEN_MARGIN).max(SCREEN_MARGIN);
     let max_y = (screen_h - height - SCREEN_MARGIN).max(SCREEN_MARGIN);
     (x.clamp(SCREEN_MARGIN, max_x), y.clamp(SCREEN_MARGIN, max_y))
+}
+
+/// Ask the window manager to activate `target`, the way `xdotool
+/// windowactivate` does.
+///
+/// Waiting passively for the window manager to restore focus is not enough:
+/// `_NET_ACTIVE_WINDOW` is updated slightly before keyboard focus actually
+/// transfers, so a keystroke sent on that signal alone falls into the gap.
+/// Requesting activation explicitly — and then confirming input focus has
+/// really moved — is what makes the paste land.
+pub fn activate_window(target: Window) -> Option<()> {
+    let (conn, screen_num) = connect()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let atom = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
+
+    let event = ClientMessageEvent::new(
+        32,
+        target,
+        atom,
+        // Source "pager", so the window manager honours the request instead of
+        // applying focus-stealing prevention.
+        [2u32, x11rb::CURRENT_TIME, 0, 0, 0],
+    );
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        event,
+    )
+    .ok()?;
+    conn.flush().ok()?;
+    Some(())
+}
+
+/// The window holding raw input focus. Unlike [`active_window`] this may be an
+/// internal child, so it is only useful for confirming focus has left us.
+pub fn input_focus() -> Option<Window> {
+    let (conn, _) = connect()?;
+    let focus = conn.get_input_focus().ok()?.reply().ok()?.focus;
+    (focus != x11rb::NONE && focus != 1).then_some(focus)
 }
 
 /// Synthesize `Ctrl+V` into whatever currently holds focus.
