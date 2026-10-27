@@ -239,6 +239,12 @@ pub fn send_paste() -> Option<()> {
             .ok()?;
     }
     conn.flush().ok()?;
+
+    // Round-trip before this connection is dropped. Each event above carries a
+    // server-side delay, and tearing the connection down while they are still
+    // pending loses them — which is exactly how a paste that "succeeded" could
+    // never arrive. Waiting for a reply proves the server worked through them.
+    conn.get_input_focus().ok()?.reply().ok()?;
     Some(())
 }
 
