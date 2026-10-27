@@ -100,7 +100,8 @@ Check the daemon any time with `systemctl --user status copycat-daemon`.
 2. Press `Super+V` to open the popup.
 3. Type to fuzzy-search, or use `Up`/`Down`.
 4. `Enter` copies the clip and closes the popup; `Esc` dismisses it.
-5. Paste with `Ctrl+V`.
+5. The clip is pasted into the window you came from. (In terminals use `Ctrl+Shift+V`,
+   since `Ctrl+V` is not paste there.)
 
 ## License
 

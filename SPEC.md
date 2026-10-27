@@ -122,11 +122,24 @@ is a one-time expense against a long-lived daemon.
    the compositor socket, matches Ubuntu-user expectations, and keeps sandbox debugging off
    the critical path. Revisit Flatpak once the portal story matures.
 
-2. **Auto-paste: copy-only for MVP; true auto-paste → P1 opt-in.**
-   Selecting an item puts it on the clipboard; the user presses `Ctrl+V`. True auto-paste
-   requires faking a keystroke, which on Wayland is only sanctioned via the RemoteDesktop
-   portal (synthetic input) or a bundled tool like `ydotool` — extra permission prompts and a
-   fragile dependency not worth blocking MVP.
+2. **Auto-paste: shipped on X11 (revised 2026-10-27); copy-only elsewhere.**
+   Originally deferred as P1 on the assumption that synthetic input needed the Wayland
+   RemoteDesktop portal. On X11 it needs no portal at all: XTEST is available, so `Enter`
+   now copies *and* pastes. The popup records the window manager's active window, asks for it
+   back via `_NET_ACTIVE_WINDOW`, waits until both the WM reports it active and raw input
+   focus has left the popup, then synthesizes `Ctrl+V`.
+
+   Hard-won implementation notes — each of these caused a silent failure:
+   - The clipboard claim is asynchronous. Poll until the selection owner changes before
+     pasting, or the target asks for content we do not own yet and gets nothing.
+   - `GetInputFocus` returns unnamed internal child windows for many toolkits. Use
+     `_NET_ACTIVE_WINDOW` for the toplevel the window manager actually manages.
+   - XTEST events carry a server-side delay; dropping the X connection while they are
+     pending discards them. Round-trip before letting the connection go.
+
+   Known limits: terminals use `Ctrl+Shift+V`, so auto-paste does nothing there (the clip is
+   still on the clipboard). If focus does not return cleanly the paste is skipped rather than
+   risking the wrong window. On Wayland this degrades to copy-only, as originally planned.
 
 3. **Global hotkey: `org.freedesktop.portal.GlobalShortcuts` portal (primary), GNOME
    custom-shortcut fallback (documented).**
@@ -157,14 +170,19 @@ independently demoable.
 - **Demo:** copy text around the desktop, then `sqlite3` shows the history. **Exit criteria:**
   100% of text copies captured in a GNOME-Wayland session, survives daemon restart.
 
-### M2 — Popup + fuzzy search + copy-back (the core loop)
+### M2 — Popup + fuzzy search + paste (the core loop) — **COMPLETE (2026-10-27)**
 *Goal: the primary interaction works end-to-end for text.*
-- `GlobalShortcuts` portal hotkey (`Super+V`) → centered libadwaita popup, search focused (P0 #4).
-- Daemon↔app IPC (D-Bus) so the popup reads history and requests actions.
-- Fuzzy incremental search, keyboard nav, `Enter` (P0 #5); copy-back to clipboard, `Esc` dismiss (P0 #6).
-- GNOME custom-shortcut fallback documented.
-- **Demo:** `Super+V`, type, Enter, `Ctrl+V` pastes the old clip. **Exit criteria:** popup <150 ms,
-  live results; the walking skeleton is complete.
+- `Super+V` → compact chrome-free popup **at the mouse pointer**, search focused (P0 #4).
+  Bound through a GNOME custom shortcut by `scripts/install-desktop.sh`; the
+  `GlobalShortcuts` portal remains the eventual Wayland-friendly route.
+- Fuzzy incremental search, keyboard nav, `Enter` (P0 #5); `Esc` dismiss (P0 #6).
+- `Enter` copies **and pastes** into the window you came from (see §5.2.2).
+- The open popup live-refreshes as the daemon captures new clips, so it is never a stale
+  snapshot.
+- No D-Bus IPC was needed: the popup reads the same SQLite history the daemon writes, and
+  owns the clipboard itself. Dropped from scope rather than built.
+- **Achieved:** `Super+V`, type, `Enter` — the clip lands in the target application.
+  Verified end to end against a real window manager, 3/3 runs.
 
 ### M3 — Multi-format (images, rich text, files)
 *Goal: stop losing non-text content.*
