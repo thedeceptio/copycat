@@ -105,6 +105,32 @@ Check the daemon any time with `systemctl --user status copycat-daemon`.
 5. The clip is pasted into the window you came from. (In terminals use `Ctrl+Shift+V`,
    since `Ctrl+V` is not paste there.)
 
+### Keyboard shortcuts in the popup
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Move through the list |
+| `Enter` | Paste the selected clip and close |
+| `Esc` | Dismiss without changing anything |
+| `Ctrl+P` | Pin / unpin the selected clip |
+| `Ctrl+D` | Delete the selected clip |
+| `Ctrl+Shift+Delete` | Clear the history (asks first; pinned clips are kept) |
+
+Everything that changes your history needs `Ctrl`, so it cannot collide with typing in the
+search box. Deleting one clip is immediate; clearing everything asks first.
+
+**Pinned clips** sort to the top, are marked with a pin, and are exempt from the history
+cap — pinning is how you keep something permanently.
+
+### How much is kept
+
+The history holds the **500 most recent unpinned clips**; older ones are dropped as new
+ones arrive. Pinned clips do not count towards that and are never dropped automatically.
+
+> **Privacy warning.** copycat currently records *everything* you copy, including passwords
+> copied out of a password manager or browser. There is no filtering yet. Use
+> `Ctrl+Shift+Delete` to clear the history, and bear this in mind until that lands.
+
 ## Troubleshooting
 
 If the popup feels slow to appear, measure before guessing — the obvious culprits on this

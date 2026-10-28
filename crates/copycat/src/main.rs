@@ -15,9 +15,9 @@ use copycat_core::model::one_line;
 use copycat_core::{default_db_path, rank, Clip, Store};
 use gtk::{gdk, glib, pango};
 use gtk::{
-    Box as GtkBox, EventControllerKey, Label, ListItem, ListScrollFlags, ListView, Orientation,
-    PropagationPhase, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, Stack,
-    StringList, StringObject,
+    Box as GtkBox, EventControllerKey, Image, Label, ListItem, ListScrollFlags, ListView,
+    Orientation, PropagationPhase, ScrolledWindow, SearchEntry, SignalListItemFactory,
+    SingleSelection, Stack, StringList, StringObject,
 };
 
 const APP_ID: &str = "dev.thedeceptio.Copycat";
@@ -86,6 +86,9 @@ const NO_SELECTION: u32 = u32::MAX;
 /// provided has to be set here instead.
 const ROW_PADDING: i32 = 10;
 
+/// Gap between a row's pin marker and its text, in pixels.
+const ROW_SPACING: i32 = 6;
+
 thread_local! {
     /// The window that held focus when the popup was summoned — where an
     /// auto-paste should land. Captured before we steal focus ourselves.
@@ -129,7 +132,7 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     let entry = SearchEntry::new();
     entry.set_placeholder_text(Some("Search clipboard history…"));
 
-    let (model, selection, list) = build_list();
+    let (model, selection, list) = build_list(ranked.clone());
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -176,17 +179,19 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
         trace.mark("positioned at pointer — this is when you see it");
     }));
 
-    populate(&model, &selection, &stack, &ranked.borrow());
+    let ui = Ui {
+        model,
+        selection: selection.clone(),
+        stack,
+        entry: entry.clone(),
+        all: all.clone(),
+        ranked: ranked.clone(),
+    };
+    ui.show(all.borrow().clone());
     trace.mark("filled the list model");
 
     // Re-rank as the user types.
-    entry.connect_search_changed(
-        glib::clone!(@strong model, @strong selection, @strong stack, @strong all, @strong ranked => move |e| {
-            let results = rank(&e.text(), all.borrow().clone());
-            populate(&model, &selection, &stack, &results);
-            *ranked.borrow_mut() = results;
-        }),
-    );
+    entry.connect_search_changed(glib::clone!(@strong ui => move |_| ui.rerank()));
 
     // Pick up clips the daemon captured while this popup is open, so the list
     // never shows a stale snapshot.
@@ -195,19 +200,16 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
         glib::timeout_add_local(
             REFRESH_INTERVAL,
             glib::clone!(
-                @strong model, @strong selection, @strong stack, @strong all, @strong ranked,
-                @strong entry, @strong revision, @weak window
+                @strong ui, @strong revision, @weak window
                 => @default-return glib::ControlFlow::Break,
                 move || {
                     if let Ok(current) = store.revision() {
                         if current != *revision.borrow() {
                             *revision.borrow_mut() = current;
-                            if let Ok(fresh) = store.recent(history_limit()) {
-                                *all.borrow_mut() = fresh;
-                                let results = rank(&entry.text(), all.borrow().clone());
-                                populate(&model, &selection, &stack, &results);
-                                *ranked.borrow_mut() = results;
-                            }
+                            // Keep the user where they were; the daemon adding a
+                            // clip should not move their selection.
+                            let keep = ui.selected().map(|clip| clip.id);
+                            ui.reload(&store, keep);
                         }
                     }
                     glib::ControlFlow::Continue
@@ -220,9 +222,17 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     let keys = EventControllerKey::new();
     keys.set_propagation_phase(PropagationPhase::Capture);
     keys.connect_key_pressed(glib::clone!(
-        @strong list, @strong selection, @strong ranked, @weak window
+        @strong list, @strong selection, @strong ranked, @strong ui, @strong store, @weak window
         => @default-return glib::Propagation::Proceed,
-        move |_, key, _, _| {
+        move |_, key, _, state| {
+            // The search entry holds focus, so anything bound here is taken away
+            // from text editing. Plain keys are left alone except the ones a
+            // search box has no use for (arrows, Enter, Escape); everything that
+            // changes the history needs Ctrl, and the destructive one needs
+            // Ctrl+Shift so it cannot be hit by accident.
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+
             match key {
                 gdk::Key::Escape => {
                     window.close();
@@ -240,6 +250,27 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
                 }
                 gdk::Key::Down => {
                     move_selection(&list, &selection, 1);
+                    glib::Propagation::Stop
+                }
+                // Ctrl+P: pin or unpin the selected clip.
+                gdk::Key::p | gdk::Key::P if ctrl => {
+                    if let Some(store) = store.as_deref() {
+                        toggle_pin(&ui, store);
+                    }
+                    glib::Propagation::Stop
+                }
+                // Ctrl+Delete: clear everything unpinned, after confirming.
+                gdk::Key::Delete | gdk::Key::KP_Delete if ctrl && shift => {
+                    if let Some(store) = store.clone() {
+                        confirm_clear(&ui, &store, &window);
+                    }
+                    glib::Propagation::Stop
+                }
+                // Ctrl+D: delete just the selected clip.
+                gdk::Key::d | gdk::Key::D if ctrl => {
+                    if let Some(store) = store.as_deref() {
+                        delete_selected(&ui, store);
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -307,39 +338,59 @@ fn read_history(store: Option<&Store>) -> Vec<Clip> {
 /// (about a dozen here) and recycles them as you scroll, so startup cost stops
 /// depending on how much history you have kept. The same applies to every
 /// keystroke in the search box, which re-populates this model.
-fn build_list() -> (StringList, SingleSelection, ListView) {
+///
+/// `ranked` is read during binding to decide whether a row shows its pin
+/// marker, so it must already match the model when the model changes — see
+/// [`Ui::show`], which is what guarantees that.
+fn build_list(ranked: Rc<RefCell<Vec<Clip>>>) -> (StringList, SingleSelection, ListView) {
     let model = StringList::new(&[]);
     let selection = SingleSelection::new(Some(model.clone()));
 
     let factory = SignalListItemFactory::new();
-    // `setup` runs once per *recycled widget*, not once per clip.
+    // `setup` runs once per *recycled widget*, not once per clip, so the extra
+    // pin marker costs a dozen widgets in total rather than one per clip.
     factory.connect_setup(|_, item| {
+        let row = GtkBox::new(Orientation::Horizontal, ROW_SPACING);
+        row.set_margin_top(ROW_PADDING);
+        row.set_margin_bottom(ROW_PADDING);
+        row.set_margin_start(ROW_PADDING);
+        row.set_margin_end(ROW_PADDING);
+
+        let pin = Image::from_icon_name("view-pin-symbolic");
+        pin.set_visible(false);
+
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_ellipsize(pango::EllipsizeMode::End);
-        label.set_margin_top(ROW_PADDING);
-        label.set_margin_bottom(ROW_PADDING);
-        label.set_margin_start(ROW_PADDING);
-        label.set_margin_end(ROW_PADDING);
+        label.set_hexpand(true);
+
+        row.append(&pin);
+        row.append(&label);
         if let Some(item) = item.downcast_ref::<ListItem>() {
-            item.set_child(Some(&label));
+            item.set_child(Some(&row));
         }
     });
+
     // `bind` runs when a recycled widget is pointed at a different clip.
-    factory.connect_bind(|_, item| {
+    factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<ListItem>() else {
             return;
         };
-        let text = item
-            .item()
-            .and_downcast::<StringObject>()
-            .map(|s| s.string());
-        let label = item.child().and_downcast::<Label>();
-        if let (Some(text), Some(label)) = (text, label) {
+        let Some((pin, label)) = item.child().and_then(row_parts) else {
+            return;
+        };
+        if let Some(text) = item.item().and_downcast::<StringObject>() {
             // `set_text`, never `set_markup`: clip text is arbitrary user data
             // and must not be parsed as Pango markup.
-            label.set_text(&text);
+            label.set_text(&text.string());
         }
+        // The model holds only display strings, so pinned state is looked up
+        // by position. `Ui::show` keeps `ranked` in step with the model.
+        let pinned = ranked
+            .borrow()
+            .get(item.position() as usize)
+            .is_some_and(|clip| clip.pinned);
+        pin.set_visible(pinned);
     });
 
     let list = ListView::new(Some(selection.clone()), Some(factory));
@@ -348,23 +399,109 @@ fn build_list() -> (StringList, SingleSelection, ListView) {
     (model, selection, list)
 }
 
-/// Replace the visible clips, select the first, and show either the list or
-/// the empty state.
-fn populate(model: &StringList, selection: &SingleSelection, stack: &Stack, clips: &[Clip]) {
-    let rows: Vec<String> = clips.iter().map(|clip| one_line(&clip.preview)).collect();
-    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
-    // One splice rather than a remove/append per row, so the view recomputes
-    // its layout once instead of once per clip.
-    model.splice(0, model.n_items(), &rows);
+/// Pull the pin marker and text label back out of a row built by `setup`.
+///
+/// The row layout is defined in exactly one place above; this is the matching
+/// reader, kept next to it so the two cannot drift apart unnoticed.
+fn row_parts(child: gtk::Widget) -> Option<(Image, Label)> {
+    let row = child.downcast::<GtkBox>().ok()?;
+    let pin = row.first_child()?.downcast::<Image>().ok()?;
+    let label = pin.next_sibling()?.downcast::<Label>().ok()?;
+    Some((pin, label))
+}
 
-    if !clips.is_empty() {
-        selection.set_selected(0);
+/// The widgets and state the popup's actions all need to touch together.
+///
+/// Pinning, deleting and clearing each have to re-read the database, re-rank
+/// against whatever is typed, rebuild the model and restore the selection.
+/// Bundling the handles keeps those four steps in one place instead of
+/// threading seven arguments through every action.
+#[derive(Clone)]
+struct Ui {
+    model: StringList,
+    selection: SingleSelection,
+    stack: Stack,
+    entry: SearchEntry,
+    /// Everything loaded from the database, before searching.
+    all: Rc<RefCell<Vec<Clip>>>,
+    /// What is currently displayed, in display order. Must always match
+    /// `model`, because row binding indexes into it.
+    ranked: Rc<RefCell<Vec<Clip>>>,
+}
+
+impl Ui {
+    /// Display `clips`, replacing whatever was shown.
+    ///
+    /// `ranked` is updated *before* the model, never after. Row binding reads
+    /// pinned state out of `ranked` by position, and `splice` can bind rows
+    /// synchronously, so updating in the other order would show one clip's text
+    /// with another's pin marker — or index past the end of a shrinking list.
+    fn show(&self, clips: Vec<Clip>) {
+        *self.ranked.borrow_mut() = clips;
+
+        let rows: Vec<String> = self
+            .ranked
+            .borrow()
+            .iter()
+            .map(|clip| one_line(&clip.preview))
+            .collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        // One splice rather than a remove/append per row, so the view
+        // recomputes its layout once instead of once per clip.
+        self.model.splice(0, self.model.n_items(), &rows);
+
+        let empty = rows.is_empty();
+        if !empty {
+            self.selection.set_selected(0);
+        }
+        self.stack
+            .set_visible_child_name(if empty { PAGE_EMPTY } else { PAGE_LIST });
     }
-    stack.set_visible_child_name(if clips.is_empty() {
-        PAGE_EMPTY
-    } else {
-        PAGE_LIST
-    });
+
+    /// Re-apply the current search text to the loaded clips.
+    fn rerank(&self) {
+        let results = rank(&self.entry.text(), self.all.borrow().clone());
+        self.show(results);
+    }
+
+    /// Re-read the database after a change, keeping the view steady.
+    ///
+    /// `keep` is the clip the user was on. Pinning re-sorts the list, so
+    /// without this the selection would jump somewhere unrelated the moment
+    /// you pinned something.
+    fn reload(&self, store: &Store, keep: Option<i64>) {
+        match store.recent(history_limit()) {
+            Ok(fresh) => *self.all.borrow_mut() = fresh,
+            Err(e) => {
+                eprintln!("copycat: could not re-read history: {e}");
+                return;
+            }
+        }
+        self.rerank();
+        if let Some(id) = keep {
+            self.select_id(id);
+        }
+    }
+
+    /// Select the row showing clip `id`, if it is still on screen.
+    fn select_id(&self, id: i64) -> bool {
+        let position = self.ranked.borrow().iter().position(|clip| clip.id == id);
+        match position {
+            Some(index) => {
+                self.selection.set_selected(index as u32);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The clip the user currently has selected.
+    fn selected(&self) -> Option<Clip> {
+        match self.selection.selected() {
+            NO_SELECTION => None,
+            index => self.ranked.borrow().get(index as usize).cloned(),
+        }
+    }
 }
 
 /// Move the selection by `delta`, clamped to the list, keeping it in view.
@@ -503,6 +640,94 @@ fn paste_and_quit(window: &adw::ApplicationWindow, target: Option<u32>) {
         close_later();
         glib::ControlFlow::Break
     });
+}
+
+/// Toggle the pin on the selected clip.
+///
+/// Pinned clips sort to the top and are exempt from the history cap, so this
+/// doubles as "keep this one". The list re-sorts immediately, and the selection
+/// follows the clip rather than staying on the row number.
+fn toggle_pin(ui: &Ui, store: &Store) {
+    let Some(clip) = ui.selected() else {
+        return;
+    };
+    match store.set_pinned(clip.id, !clip.pinned) {
+        Ok(true) => {
+            eprintln!(
+                "copycat: {} clip {}",
+                if clip.pinned { "unpinned" } else { "pinned" },
+                clip.id
+            );
+            ui.reload(store, Some(clip.id));
+        }
+        Ok(false) => eprintln!("copycat: clip {} is already gone", clip.id),
+        Err(e) => eprintln!("copycat: could not change pin on clip {}: {e}", clip.id),
+    }
+}
+
+/// Delete the selected clip.
+///
+/// Deliberately not confirmed: it removes one item that is still on screen, and
+/// a prompt for every deletion would make clearing out junk tedious. Clearing
+/// the *whole* history is confirmed, because that one cannot be shrugged off.
+fn delete_selected(ui: &Ui, store: &Store) {
+    let Some(clip) = ui.selected() else {
+        return;
+    };
+    // Where to land afterwards: the row that slides up into this one's place.
+    let position = ui.selection.selected();
+    match store.delete(clip.id) {
+        Ok(true) => {
+            eprintln!("copycat: deleted clip {}", clip.id);
+            ui.reload(store, None);
+            let remaining = ui.selection.n_items();
+            if remaining > 0 {
+                ui.selection.set_selected(position.min(remaining - 1));
+            }
+        }
+        Ok(false) => eprintln!("copycat: clip {} was already gone", clip.id),
+        Err(e) => eprintln!("copycat: could not delete clip {}: {e}", clip.id),
+    }
+}
+
+/// Ask before clearing the history, then clear everything unpinned.
+///
+/// Pinned clips survive: pinning is how you say "keep this", and having a
+/// clear-all silently discard the things you explicitly kept would make pinning
+/// untrustworthy. The dialog says so, so the behaviour is not a surprise.
+fn confirm_clear(ui: &Ui, store: &Rc<Store>, window: &adw::ApplicationWindow) {
+    let pinned = ui.all.borrow().iter().filter(|clip| clip.pinned).count();
+    let body = if pinned == 0 {
+        "This deletes every clip in your history. It cannot be undone.".to_string()
+    } else {
+        format!(
+            "This deletes every unpinned clip in your history. \
+             Your {pinned} pinned clip(s) are kept. It cannot be undone."
+        )
+    };
+
+    let dialog = adw::AlertDialog::new(Some("Clear clipboard history?"), Some(&body));
+    dialog.add_responses(&[("cancel", "Cancel"), ("clear", "Clear")]);
+    dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    dialog.choose(
+        window,
+        gtk::gio::Cancellable::NONE,
+        glib::clone!(@strong ui, @strong store => move |response| {
+            if response != "clear" {
+                return;
+            }
+            match store.clear_unpinned() {
+                Ok(n) => {
+                    eprintln!("copycat: cleared {n} clip(s)");
+                    ui.reload(&store, None);
+                }
+                Err(e) => eprintln!("copycat: could not clear history: {e}"),
+            }
+        }),
+    );
 }
 
 /// Copy the currently selected clip's full content back to the clipboard.

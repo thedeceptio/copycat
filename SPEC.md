@@ -208,8 +208,32 @@ independently demoable.
 - Content-type filter toggle: text / images / files (P1 #13).
 - **Demo:** copy an image and a file, recall and paste both. **Exit criteria:** each type round-trips.
 
-### M4 — Privacy, pinning, management
+### M4 — Privacy, pinning, management — **PARTIAL (2026-10-28)**
 *Goal: the trust + curation features.*
+
+**Done so far — curation and the cap (P0 #7, #8, and the #2 cap):**
+- Pin/unpin (`Ctrl+P`), delete one (`Ctrl+D`), clear all with a confirm dialog
+  (`Ctrl+Shift+Delete`). Pinned clips sort first, show a marker, and survive clear-all —
+  pinning has to mean "keep this" or it means nothing.
+- The 500-item cap is **now actually enforced**. `enforce_cap` had existed and been tested
+  since M1 but was never called, so history grew without limit. Trimming happens on insert,
+  the only moment the cap can be exceeded.
+- Clip ordering is deterministic. `created_at` is millisecond-resolution, so a burst of
+  copies shared a timestamp and "newest first" fell back to whatever SQLite returned; id
+  now breaks the tie, which also decides correctly *which* clip the cap drops.
+- Mutating actions re-read the database and restore the selection to the same clip, since
+  pinning re-sorts the list under the cursor.
+
+**Still outstanding — the privacy half (P0 #9):**
+- Password-manager detection, per-app exclude list, optional auto-expiry. **Nothing is
+  filtered today: everything copied is recorded, passwords included.**
+- Design note from investigating it: the only mechanism that can work here is the
+  `x-kde-passwordManagerHint` target, which the source application sets to declare a secret.
+  `WM_CLASS`-based exclusion is useless for browser-built-in password managers, because
+  excluding the browser would exclude most ordinary copying. Whether Chrome and Firefox
+  actually set that hint needs **measuring before any of this is built** — if they do not,
+  app-level detection cannot protect the common case and the honest answer is a manual
+  pause-capture toggle rather than a filter that implies safety it cannot deliver.
 - Skip password-manager clipboards (concealed mimetypes); per-app exclude-list (P0 #9).
 - Optional auto-expiry of unpinned items (default off) (P0 #9).
 - Pinning: pin/sort-to-top/expiry-exempt (P0 #7); delete one / clear all with confirm (P0 #8).
