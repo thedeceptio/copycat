@@ -2,14 +2,15 @@
 //!
 //! We create a tiny unmapped window, ask XFIXES to notify us whenever the
 //! `CLIPBOARD` selection owner changes, and on each change request the content
-//! as UTF-8 text. New text is written to the [`Store`], which handles duplicate
-//! collapsing and the history cap.
+//! as UTF-8 text. New text is written to the [`Store`], which collapses
+//! duplicates; trimming the history back to the cap is done here after each
+//! insert, since the store deliberately has no opinion about policy.
 //!
 //! Large transfers (the `INCR` protocol) and non-text targets are skipped for
 //! now; images/rich text/files arrive in M3.
 
 use crate::capture;
-use copycat_core::{NewClip, Store};
+use copycat_core::{Store, DEFAULT_HISTORY_CAP};
 use std::error::Error;
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _, SelectionEventMask};
@@ -82,16 +83,18 @@ pub fn run(store: &Store) -> Result<()> {
             }
             Event::SelectionNotify(ev) => {
                 if let Some(text) = read_text(&conn, &atoms, ev)? {
-                    if capture::should_store_text(&text) {
-                        let clip = NewClip::text(&text);
-                        match store.insert(&clip) {
-                            Ok(_) => eprintln!(
-                                "copycatd: captured {} chars: {:?}",
-                                text.chars().count(),
-                                clip.preview
-                            ),
-                            Err(e) => eprintln!("copycatd: store error: {e}"),
+                    match capture::capture(store, &text) {
+                        Ok(capture::Captured::Stored { trimmed }) => {
+                            eprintln!("copycatd: captured {} chars", text.chars().count());
+                            if trimmed > 0 {
+                                eprintln!(
+                                    "copycatd: dropped {trimmed} clip(s) over the \
+                                     {DEFAULT_HISTORY_CAP}-item cap"
+                                );
+                            }
                         }
+                        Ok(capture::Captured::Skipped) => {}
+                        Err(e) => eprintln!("copycatd: store error: {e}"),
                     }
                 }
             }

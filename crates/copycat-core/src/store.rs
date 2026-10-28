@@ -101,7 +101,7 @@ impl Store {
     pub fn recent(&self, limit: usize) -> Result<Vec<Clip>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, content, preview, hash, created_at, pinned FROM clips
-             ORDER BY pinned DESC, created_at DESC
+             ORDER BY pinned DESC, created_at DESC, id DESC
              LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_clip)?;
@@ -110,6 +110,10 @@ impl Store {
 
     /// Clips whose full content contains `query` (case-insensitive), pinned
     /// first then newest-first, capped at `limit`.
+    ///
+    /// Ties on `created_at` are broken by id. Timestamps have millisecond
+    /// resolution, so two clips captured in the same millisecond would
+    /// otherwise come back in whatever order SQLite felt like.
     ///
     /// This is the candidate filter; fuzzy ranking lives in [`crate::search`].
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Clip>> {
@@ -120,7 +124,7 @@ impl Store {
             "SELECT id, kind, content, preview, hash, created_at, pinned FROM clips
              WHERE (CASE WHEN content = '' THEN preview ELSE content END)
                    LIKE ?1 ESCAPE '\\'
-             ORDER BY pinned DESC, created_at DESC
+             ORDER BY pinned DESC, created_at DESC, id DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![like, limit as i64], row_to_clip)?;
@@ -187,7 +191,7 @@ impl Store {
              WHERE pinned = 0
                AND id NOT IN (
                    SELECT id FROM clips WHERE pinned = 0
-                   ORDER BY created_at DESC
+                   ORDER BY created_at DESC, id DESC
                    LIMIT ?1
                )",
             params![max as i64],
@@ -415,6 +419,24 @@ mod tests {
         let remaining = s.recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].preview, "keep");
+    }
+
+    #[test]
+    fn clips_from_the_same_millisecond_still_order_newest_first() {
+        // Timestamps are millisecond-resolution, so a burst of copies can share
+        // one. Without a tiebreaker the order would be whatever SQLite returns.
+        let store = Store::open_in_memory().unwrap();
+        let at = 1_700_000_000_000;
+        for text in ["first", "second", "third"] {
+            store.insert_at(&NewClip::text(text), at).unwrap();
+        }
+        let order: Vec<String> = store
+            .recent(10)
+            .unwrap()
+            .iter()
+            .map(|c| c.text().to_string())
+            .collect();
+        assert_eq!(order, vec!["third", "second", "first"]);
     }
 
     #[test]

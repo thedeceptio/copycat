@@ -16,6 +16,14 @@ pub use store::{Store, StoreError};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// How many unpinned clips the history keeps before the oldest are dropped.
+///
+/// Pinned clips are exempt and do not count towards it, so pinning something
+/// is also how you keep it indefinitely. Lives here rather than in the daemon
+/// because the popup's own display limit should not silently disagree with the
+/// storage cap.
+pub const DEFAULT_HISTORY_CAP: usize = 500;
+
 /// Current wall-clock time as Unix milliseconds.
 ///
 /// Used as the default timestamp for newly captured clips. Returns 0 if the
