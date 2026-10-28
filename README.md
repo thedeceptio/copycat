@@ -6,8 +6,10 @@ copycat keeps a searchable history of what you copy and lets you paste any past 
 two keystrokes. It aims for *CopyQ's capability with GPaste's native feel*, without the Wayland
 fragility or GNOME-upgrade breakage of shell-extension managers.
 
-> Status: **early development** (M0 scaffold). See [`SPEC.md`](SPEC.md) for the full MVP spec
-> and milestone plan.
+> Status: **early development.** Text capture, the search popup and auto-paste work today on
+> X11 (M0–M2). Images, rich text and file copies are not captured yet, and there is no
+> password-manager filtering — do not rely on it to stay out of your secrets. See
+> [`SPEC.md`](SPEC.md) for the full MVP spec and milestone plan.
 
 ## Architecture
 
