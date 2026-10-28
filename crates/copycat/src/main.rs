@@ -4,6 +4,7 @@
 //! portal hotkey lands). It loads the history written by `copycatd`, lets you
 //! fuzzy-search it, and on Enter copies the chosen clip back to the clipboard.
 
+mod trace;
 mod x11util;
 
 use std::cell::{Cell, RefCell};
@@ -61,10 +62,16 @@ thread_local! {
 }
 
 fn main() -> glib::ExitCode {
+    let trace = Rc::new(trace::Trace::new());
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(|app| {
+    trace.mark("built AdwApplication");
+
+    app.connect_activate(move |app| {
+        trace.mark("activated (GTK init + D-Bus name registration)");
+
         // Remember where the user was working before our window takes focus.
         PASTE_TARGET.with(|target| target.set(x11util::active_window()));
+        trace.mark("found the window to paste into");
 
         // GTK applications are single-instance: launching copycat again (e.g.
         // pressing the hotkey) activates the running process rather than
@@ -73,16 +80,19 @@ fn main() -> glib::ExitCode {
         // contents current, so the re-raised window is never stale.
         if let Some(window) = app.active_window() {
             window.present();
+            trace.mark("re-presented the existing window");
             return;
         }
-        build_ui(app);
+        build_ui(app, trace.clone());
     });
     app.run()
 }
 
-fn build_ui(app: &adw::Application) {
+fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     let store: Option<Rc<Store>> = open_store().map(Rc::new);
+    trace.mark("opened the history database");
     let all: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new(read_history(store.as_deref())));
+    trace.mark("read history");
     let ranked: Rc<RefCell<Vec<Clip>>> = Rc::new(RefCell::new(all.borrow().clone()));
 
     let entry = SearchEntry::new();
@@ -129,13 +139,15 @@ fn build_ui(app: &adw::Application) {
 
     // GTK4 has no window-positioning API, so place it ourselves once it has an
     // X11 surface. Off X11 this does nothing and the compositor decides.
-    window.connect_map(|window| {
+    window.connect_map(glib::clone!(@strong trace => move |window| {
         if let Some(xid) = window_xid(window) {
             x11util::place_at_pointer(xid, POPUP_WIDTH, POPUP_HEIGHT);
         }
-    });
+        trace.mark("window mapped and positioned — this is when you see it");
+    }));
 
     populate(&list, &stack, &ranked.borrow());
+    trace.mark("built the list rows");
 
     // Re-rank as the user types.
     entry.connect_search_changed(
@@ -215,8 +227,10 @@ fn build_ui(app: &adw::Application) {
         }),
     );
 
+    trace.mark("wired up signals");
     window.present();
     entry.grab_focus();
+    trace.mark("presented");
 }
 
 /// Open the history database, or report why we could not.
