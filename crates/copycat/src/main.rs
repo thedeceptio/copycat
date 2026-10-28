@@ -13,15 +13,34 @@ use std::rc::Rc;
 use adw::prelude::*;
 use copycat_core::model::one_line;
 use copycat_core::{default_db_path, rank, Clip, Store};
-use gtk::{gdk, glib};
+use gtk::{gdk, glib, pango};
 use gtk::{
-    Box as GtkBox, EventControllerKey, ListBox, Orientation, PropagationPhase, ScrolledWindow,
-    SearchEntry, Stack,
+    Box as GtkBox, EventControllerKey, Label, ListItem, ListScrollFlags, ListView, Orientation,
+    PropagationPhase, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, Stack,
+    StringList, StringObject,
 };
 
 const APP_ID: &str = "dev.thedeceptio.Copycat";
 /// How many recent clips to load into the popup.
 const HISTORY_LIMIT: usize = 500;
+
+/// Read the history limit, honouring a `COPYCAT_HISTORY_LIMIT` override.
+///
+/// The override exists because the popup builds one widget per clip up front,
+/// so the row count is a prime suspect whenever startup feels slow. Being able
+/// to vary it without a rebuild turns "is it the rows?" into one measurement.
+fn history_limit() -> usize {
+    parse_history_limit(std::env::var("COPYCAT_HISTORY_LIMIT").ok().as_deref())
+}
+
+/// Parse a history-limit override, falling back to [`HISTORY_LIMIT`].
+///
+/// Anything unparseable is ignored rather than fatal: a typo in an environment
+/// variable should not stop the popup opening.
+fn parse_history_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(HISTORY_LIMIT)
+}
 
 /// Grace period between putting a clip on the clipboard and quitting.
 ///
@@ -54,6 +73,18 @@ const FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(700)
 /// Names of the [`Stack`] pages, so we can swap list vs. empty state.
 const PAGE_LIST: &str = "list";
 const PAGE_EMPTY: &str = "empty";
+
+/// GTK's "nothing is selected" sentinel for list positions.
+///
+/// `GTK_INVALID_LIST_POSITION` is `0xffffffff`. Treating it as an ordinary
+/// index would mean indexing at four billion, so every read of
+/// [`SingleSelection::selected`] has to check for it.
+const NO_SELECTION: u32 = u32::MAX;
+
+/// Padding around each row's text, in pixels. Rows are drawn by a recycled
+/// [`Label`] rather than a full `AdwActionRow`, so the spacing that widget
+/// provided has to be set here instead.
+const ROW_PADDING: i32 = 10;
 
 thread_local! {
     /// The window that held focus when the popup was summoned — where an
@@ -98,9 +129,7 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     let entry = SearchEntry::new();
     entry.set_placeholder_text(Some("Search clipboard history…"));
 
-    let list = ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
-    list.add_css_class("boxed-list");
+    let (model, selection, list) = build_list();
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -140,20 +169,21 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     // GTK4 has no window-positioning API, so place it ourselves once it has an
     // X11 surface. Off X11 this does nothing and the compositor decides.
     window.connect_map(glib::clone!(@strong trace => move |window| {
+        trace.mark("GTK finished realize + layout (inside present)");
         if let Some(xid) = window_xid(window) {
             x11util::place_at_pointer(xid, POPUP_WIDTH, POPUP_HEIGHT);
         }
-        trace.mark("window mapped and positioned — this is when you see it");
+        trace.mark("positioned at pointer — this is when you see it");
     }));
 
-    populate(&list, &stack, &ranked.borrow());
-    trace.mark("built the list rows");
+    populate(&model, &selection, &stack, &ranked.borrow());
+    trace.mark("filled the list model");
 
     // Re-rank as the user types.
     entry.connect_search_changed(
-        glib::clone!(@strong list, @strong stack, @strong all, @strong ranked => move |e| {
+        glib::clone!(@strong model, @strong selection, @strong stack, @strong all, @strong ranked => move |e| {
             let results = rank(&e.text(), all.borrow().clone());
-            populate(&list, &stack, &results);
+            populate(&model, &selection, &stack, &results);
             *ranked.borrow_mut() = results;
         }),
     );
@@ -165,17 +195,17 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
         glib::timeout_add_local(
             REFRESH_INTERVAL,
             glib::clone!(
-                @strong list, @strong stack, @strong all, @strong ranked,
+                @strong model, @strong selection, @strong stack, @strong all, @strong ranked,
                 @strong entry, @strong revision, @weak window
                 => @default-return glib::ControlFlow::Break,
                 move || {
                     if let Ok(current) = store.revision() {
                         if current != *revision.borrow() {
                             *revision.borrow_mut() = current;
-                            if let Ok(fresh) = store.recent(HISTORY_LIMIT) {
+                            if let Ok(fresh) = store.recent(history_limit()) {
                                 *all.borrow_mut() = fresh;
                                 let results = rank(&entry.text(), all.borrow().clone());
-                                populate(&list, &stack, &results);
+                                populate(&model, &selection, &stack, &results);
                                 *ranked.borrow_mut() = results;
                             }
                         }
@@ -190,7 +220,7 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     let keys = EventControllerKey::new();
     keys.set_propagation_phase(PropagationPhase::Capture);
     keys.connect_key_pressed(glib::clone!(
-        @strong list, @strong ranked, @weak window
+        @strong list, @strong selection, @strong ranked, @weak window
         => @default-return glib::Propagation::Proceed,
         move |_, key, _, _| {
             match key {
@@ -199,17 +229,17 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
                     glib::Propagation::Stop
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
-                    if let Some(previous) = copy_selected(&list, &ranked.borrow()) {
+                    if let Some(previous) = copy_selected(&selection, &ranked.borrow()) {
                         dismiss_after_copy(&window, previous);
                     }
                     glib::Propagation::Stop
                 }
                 gdk::Key::Up => {
-                    move_selection(&list, -1, ranked.borrow().len());
+                    move_selection(&list, &selection, -1);
                     glib::Propagation::Stop
                 }
                 gdk::Key::Down => {
-                    move_selection(&list, 1, ranked.borrow().len());
+                    move_selection(&list, &selection, 1);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -219,9 +249,10 @@ fn build_ui(app: &adw::Application, trace: Rc<trace::Trace>) {
     window.add_controller(keys);
 
     // Clicking a row copies it too.
-    list.connect_row_activated(
-        glib::clone!(@strong ranked, @weak window => move |list, _| {
-            if let Some(previous) = copy_selected(list, &ranked.borrow()) {
+    list.connect_activate(
+        glib::clone!(@strong selection, @strong ranked, @weak window => move |_, position| {
+            selection.set_selected(position);
+            if let Some(previous) = copy_selected(&selection, &ranked.borrow()) {
                 dismiss_after_copy(&window, previous);
             }
         }),
@@ -258,27 +289,76 @@ fn read_history(store: Option<&Store>) -> Vec<Clip> {
     let Some(store) = store else {
         return Vec::new();
     };
-    store.recent(HISTORY_LIMIT).unwrap_or_else(|e| {
+    store.recent(history_limit()).unwrap_or_else(|e| {
         eprintln!("copycat: failed to read history: {e}");
         Vec::new()
     })
 }
 
-/// Rebuild the list rows from `clips`, select the first, and show either the
-/// list or the empty state.
-fn populate(list: &ListBox, stack: &Stack, clips: &[Clip]) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    for clip in clips {
-        let row = adw::ActionRow::new();
-        // Clip text is arbitrary user data, never Pango markup.
-        row.set_use_markup(false);
-        row.set_title(&one_line(&clip.preview));
-        list.append(&row);
-    }
-    if let Some(row) = list.row_at_index(0) {
-        list.select_row(Some(&row));
+/// Build the clip list as a *virtualised* view.
+///
+/// This is the difference between a popup that opens instantly and one that
+/// does not. The obvious construction — one `AdwActionRow` per clip, appended
+/// to a `ListBox` — measured at ~8.8 ms per row on the development machine, so
+/// a 91-clip history spent 836 ms laying out rows before the window appeared,
+/// and the 500-clip cap would have taken roughly four seconds.
+///
+/// A [`ListView`] instead creates widgets only for the rows actually on screen
+/// (about a dozen here) and recycles them as you scroll, so startup cost stops
+/// depending on how much history you have kept. The same applies to every
+/// keystroke in the search box, which re-populates this model.
+fn build_list() -> (StringList, SingleSelection, ListView) {
+    let model = StringList::new(&[]);
+    let selection = SingleSelection::new(Some(model.clone()));
+
+    let factory = SignalListItemFactory::new();
+    // `setup` runs once per *recycled widget*, not once per clip.
+    factory.connect_setup(|_, item| {
+        let label = Label::new(None);
+        label.set_xalign(0.0);
+        label.set_ellipsize(pango::EllipsizeMode::End);
+        label.set_margin_top(ROW_PADDING);
+        label.set_margin_bottom(ROW_PADDING);
+        label.set_margin_start(ROW_PADDING);
+        label.set_margin_end(ROW_PADDING);
+        if let Some(item) = item.downcast_ref::<ListItem>() {
+            item.set_child(Some(&label));
+        }
+    });
+    // `bind` runs when a recycled widget is pointed at a different clip.
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<ListItem>() else {
+            return;
+        };
+        let text = item
+            .item()
+            .and_downcast::<StringObject>()
+            .map(|s| s.string());
+        let label = item.child().and_downcast::<Label>();
+        if let (Some(text), Some(label)) = (text, label) {
+            // `set_text`, never `set_markup`: clip text is arbitrary user data
+            // and must not be parsed as Pango markup.
+            label.set_text(&text);
+        }
+    });
+
+    let list = ListView::new(Some(selection.clone()), Some(factory));
+    // Match the old ListBox feel, where a single click chose a clip.
+    list.set_single_click_activate(true);
+    (model, selection, list)
+}
+
+/// Replace the visible clips, select the first, and show either the list or
+/// the empty state.
+fn populate(model: &StringList, selection: &SingleSelection, stack: &Stack, clips: &[Clip]) {
+    let rows: Vec<String> = clips.iter().map(|clip| one_line(&clip.preview)).collect();
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    // One splice rather than a remove/append per row, so the view recomputes
+    // its layout once instead of once per clip.
+    model.splice(0, model.n_items(), &rows);
+
+    if !clips.is_empty() {
+        selection.set_selected(0);
     }
     stack.set_visible_child_name(if clips.is_empty() {
         PAGE_EMPTY
@@ -287,17 +367,32 @@ fn populate(list: &ListBox, stack: &Stack, clips: &[Clip]) {
     });
 }
 
-/// Move the selection by `delta`, clamped to `[0, count)`, keeping it in view.
-fn move_selection(list: &ListBox, delta: i32, count: usize) {
+/// Move the selection by `delta`, clamped to the list, keeping it in view.
+fn move_selection(list: &ListView, selection: &SingleSelection, delta: i32) {
+    let count = selection.n_items();
     if count == 0 {
         return;
     }
-    let current = list.selected_row().map(|r| r.index()).unwrap_or(0);
-    let next = (current + delta).clamp(0, count as i32 - 1);
-    if let Some(row) = list.row_at_index(next) {
-        list.select_row(Some(&row));
-        row.grab_focus();
-    }
+    let current = match selection.selected() {
+        NO_SELECTION => 0,
+        index => index,
+    };
+    let next = next_index(current, delta, count);
+    selection.set_selected(next);
+    // Virtualised rows are only built when visible, so moving the selection
+    // off-screen has to be paired with scrolling it back into view.
+    list.scroll_to(next, ListScrollFlags::FOCUS, None);
+}
+
+/// Where the selection lands after moving `delta` from `current` in a list of
+/// `count` items, clamped to the ends.
+///
+/// Pure, so the saturating arithmetic is tested without a display. `count` is
+/// assumed non-zero; callers return early on an empty list.
+fn next_index(current: u32, delta: i32, count: u32) -> u32 {
+    let last = count.saturating_sub(1);
+    let next = current as i64 + delta as i64;
+    next.clamp(0, last as i64) as u32
 }
 
 /// The popup's X11 window id, if we are running on X11.
@@ -414,16 +509,16 @@ fn paste_and_quit(window: &adw::ApplicationWindow, target: Option<u32>) {
 ///
 /// Returns whoever owned the clipboard beforehand, so the caller can tell when
 /// our own claim has taken effect. `None` means nothing was copied.
-fn copy_selected(list: &ListBox, ranked: &[Clip]) -> Option<Option<u32>> {
-    let row = list.selected_row().or_else(|| {
-        eprintln!("copycat: nothing selected, clipboard left alone");
-        None
-    })?;
-    let clip = ranked.get(row.index() as usize).or_else(|| {
-        eprintln!(
-            "copycat: selected row {} has no matching clip, clipboard left alone",
-            row.index()
-        );
+fn copy_selected(selection: &SingleSelection, ranked: &[Clip]) -> Option<Option<u32>> {
+    let index = match selection.selected() {
+        NO_SELECTION => {
+            eprintln!("copycat: nothing selected, clipboard left alone");
+            return None;
+        }
+        index => index,
+    };
+    let clip = ranked.get(index as usize).or_else(|| {
+        eprintln!("copycat: selected row {index} has no matching clip, clipboard left alone");
         None
     })?;
     let display = gdk::Display::default().or_else(|| {
@@ -439,4 +534,68 @@ fn copy_selected(list: &ListBox, ranked: &[Clip]) -> Option<Option<u32>> {
         clip.text().chars().count()
     );
     Some(previous_owner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_override_uses_the_built_in_limit() {
+        assert_eq!(parse_history_limit(None), HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn an_override_is_honoured() {
+        assert_eq!(parse_history_limit(Some("25")), 25);
+        assert_eq!(parse_history_limit(Some("  40 ")), 40);
+    }
+
+    #[test]
+    fn zero_is_a_legitimate_override() {
+        // Useful for isolating row-building cost from everything else.
+        assert_eq!(parse_history_limit(Some("0")), 0);
+    }
+
+    #[test]
+    fn a_nonsense_override_falls_back_instead_of_failing() {
+        for bad in ["", "lots", "-5", "3.5"] {
+            assert_eq!(
+                parse_history_limit(Some(bad)),
+                HISTORY_LIMIT,
+                "{bad:?} should fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_moves_by_one_in_each_direction() {
+        assert_eq!(next_index(3, 1, 10), 4);
+        assert_eq!(next_index(3, -1, 10), 2);
+    }
+
+    #[test]
+    fn selection_stops_at_the_ends_rather_than_wrapping() {
+        assert_eq!(next_index(0, -1, 10), 0, "up from the top stays put");
+        assert_eq!(next_index(9, 1, 10), 9, "down from the bottom stays put");
+    }
+
+    #[test]
+    fn a_single_item_list_has_nowhere_to_go() {
+        assert_eq!(next_index(0, 1, 1), 0);
+        assert_eq!(next_index(0, -1, 1), 0);
+    }
+
+    #[test]
+    fn a_stale_index_past_the_end_is_pulled_back_into_range() {
+        // The list shrinks as you type, so the old selection can be too big.
+        assert_eq!(next_index(500, 1, 10), 9);
+    }
+
+    #[test]
+    fn large_jumps_do_not_overflow() {
+        // u32 index plus i32 delta must not wrap around in either direction.
+        assert_eq!(next_index(0, i32::MIN, 10), 0);
+        assert_eq!(next_index(u32::MAX - 1, i32::MAX, 10), 9);
+    }
 }

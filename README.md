@@ -105,6 +105,22 @@ Check the daemon any time with `systemctl --user status copycat-daemon`.
 5. The clip is pasted into the window you came from. (In terminals use `Ctrl+Shift+V`,
    since `Ctrl+V` is not paste there.)
 
+## Troubleshooting
+
+If the popup feels slow to appear, measure before guessing — the obvious culprits on this
+codebase have twice turned out to be innocent:
+
+```bash
+COPYCAT_TRACE=1 copycat
+```
+
+That times each startup phase to stderr, from process exec (not from `main`, so time spent
+in the dynamic linker is visible) through to the window being on screen. `COPYCAT_HISTORY_LIMIT=<n>`
+loads fewer clips, which tells you quickly whether a cost scales with history size.
+
+For reference, opening the popup should take roughly 200 ms, nearly all of it fixed GTK
+startup.
+
 ## License
 
 GPL-3.0-or-later.

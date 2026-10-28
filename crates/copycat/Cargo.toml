@@ -14,7 +14,9 @@ path = "src/main.rs"
 [dependencies]
 copycat-core = { workspace = true }
 # Matches the ship target (Ubuntu 24.04: GTK 4.14 / libadwaita 1.5); see SPEC §5.1.
-gtk = { package = "gtk4", version = "0.8" }
+# v4_12 is needed for ListView::scroll_to, which keeps the keyboard selection
+# visible now that rows are virtualised rather than all built up front.
+gtk = { package = "gtk4", version = "0.8", features = ["v4_12"] }
 adw = { package = "libadwaita", version = "0.6", features = ["v1_5"] }
 # X11-only: GTK4 has no window-positioning API, and pasting needs XTEST.
 gdk4-x11 = "0.8"

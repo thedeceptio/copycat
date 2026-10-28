@@ -183,6 +183,23 @@ independently demoable.
   owns the clipboard itself. Dropped from scope rather than built.
 - **Achieved:** `Super+V`, type, `Enter` — the clip lands in the target application.
   Verified end to end against a real window manager, 3/3 runs.
+- **The list must stay virtualised (revised 2026-10-28).** The popup first took ~900 ms to
+  appear. The cost was not startup, the database or the linker — measured at 30 ms, 0.5 ms
+  and 0.3 ms respectively — but one `AdwActionRow` per clip, at **~8.8 ms each**, laid out
+  inside `window.present()`:
+
+  | rows | 0 | 1 | 10 | 45 | 91 |
+  | --- | --- | --- | --- | --- | --- |
+  | GTK layout | 34 ms | 72 ms | 114 ms | 363 ms | **836 ms** |
+
+  Linear in history size, so the 500-clip cap would have cost roughly four seconds, and it
+  was re-paid on every keystroke in the search box. Fixed by moving to a GTK4 `ListView`,
+  which builds widgets only for the visible rows and recycles them. Cost now scales with
+  window size, not history size. Anything that reintroduces one widget per clip reintroduces
+  this bug — and it hides well, because it is invisible until the history fills up.
+- Guessing was expensive here, twice over: a plausible accessibility-bus error and the GL
+  renderer were both wrong, and both were eliminated in one run each by varying a single
+  factor. `COPYCAT_TRACE=1` exists so the next such question starts with a measurement.
 
 ### M3 — Multi-format (images, rich text, files)
 *Goal: stop losing non-text content.*
